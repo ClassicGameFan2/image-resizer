@@ -3,21 +3,31 @@
 #include "stb_image.h"
 #include "stb_image_write.h"
 
-// We tell main.cpp that our FSR function exists in the other file!
+// Bring in both FSR functions!
 extern void scaleFSR_EASU(const unsigned char* input, int inW, int inH, 
                           unsigned char* output, int outW, int outH);
+                          
+extern void applyFSR_RCAS(const unsigned char* input, int w, int h, 
+                          unsigned char* output, float sharpness);
 
 int main(int argc, char** argv) {
     std::cout << "--- Image Resizer (AMD FSR 1.0 CPU Port) ---" << std::endl;
 
     if (argc < 4) {
-        std::cout << "Usage: image-resizer.exe <input.png> <output.png> <scale>" << std::endl;
+        std::cout << "Usage: image-resizer.exe <input.png> <output.png> <scale> [sharpness]" << std::endl;
+        std::cout << "Sharpness: 0.0 (Max Sharp) to 2.0 (Soft). Default is 0.2" << std::endl;
         return 1;
     }
 
     const char* inputFile = argv[1];
     const char* outputFile = argv[2];
     float scale = std::stof(argv[3]);
+    
+    // Set default sharpness to 0.2, but allow the user to override it!
+    float sharpness = 0.2f;
+    if (argc > 4) {
+        sharpness = std::stof(argv[4]);
+    }
 
     std::cout << "Loading: " << inputFile << "..." << std::endl;
 
@@ -29,24 +39,34 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    int newWidth = (int)(width * scale);
-    int newHeight = (int)(height * scale);
+    int newW = (int)(width * scale);
+    int newH = (int)(height * scale);
 
-    std::cout << "Original Size: " << width << "x" << height << std::endl;
-    std::cout << "Scaling to: " << newWidth << "x" << newHeight << " (Scale: " << scale << "x)" << std::endl;
+    std::cout << "Scaling to: " << newW << "x" << newH << " (Scale: " << scale << "x)" << std::endl;
+    std::cout << "Sharpness level: " << sharpness << std::endl;
 
-    unsigned char* outputData = new unsigned char[newWidth * newHeight * 4];
+    // Canvas 1: The smoothed EASU image
+    unsigned char* easuData = new unsigned char[newW * newH * 4];
+    
+    // Canvas 2: The final sharpened RCAS image
+    unsigned char* finalData = new unsigned char[newW * newH * 4];
 
-    // BOOM! We run the FSR 1.0 math instead of Nearest Neighbor!
-    std::cout << "Processing (FSR 1.0 EASU)..." << std::endl;
-    scaleFSR_EASU(imgData, width, height, outputData, newWidth, newHeight);
+    // PASS 1: Scale and Smooth
+    std::cout << "Pass 1: FSR EASU (Scaling)..." << std::endl;
+    scaleFSR_EASU(imgData, width, height, easuData, newW, newH);
+
+    // PASS 2: Sharpen and Restore Texture
+    std::cout << "Pass 2: FSR RCAS (Sharpening)..." << std::endl;
+    applyFSR_RCAS(easuData, newW, newH, finalData, sharpness);
 
     std::cout << "Saving: " << outputFile << "..." << std::endl;
-    int stride = newWidth * 4;
-    int success = stbi_write_png(outputFile, newWidth, newHeight, 4, outputData, stride);
+    int stride = newW * 4;
+    int success = stbi_write_png(outputFile, newW, newH, 4, finalData, stride);
 
+    // Free all three memory blocks
     stbi_image_free(imgData);
-    delete[] outputData;
+    delete[] easuData;
+    delete[] finalData;
 
     if (success) {
         std::cout << "Image scaled and saved successfully!" << std::endl;
