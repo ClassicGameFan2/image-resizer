@@ -1,0 +1,25 @@
+name: Build C++ Application
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure CMake
+      run: cmake -B build -S .
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Upload Executable
+      uses: actions/upload-artifact@v3
+      with:
+        name: image-resizer-windows
+        path: build/Release/image-resizer.exe
