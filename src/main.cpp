@@ -1,39 +1,51 @@
 #include <iostream>
 #include <string>
+#include <vector>
 #include "stb_image.h"
 #include "stb_image_write.h"
 
-// Bring in both FSR functions!
-extern void scaleFSR_EASU(const unsigned char* input, int inW, int inH, 
-                          unsigned char* output, int outW, int outH);
-                          
-extern void applyFSR_RCAS(const unsigned char* input, int w, int h, 
-                          unsigned char* output, float sharpness);
+extern void scaleFSR_EASU(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH);
+extern void applyFSR_RCAS(const unsigned char* input, int w, int h, unsigned char* output, float sharpness);
+
+// We bring back Nearest Neighbor!
+void scaleNearestNeighbor(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH) {
+    for (int y = 0; y < outH; ++y) {
+        for (int x = 0; x < outW; ++x) {
+            int srcX = (x * inW) / outW;
+            int srcY = (y * inH) / outH;
+            int srcIdx = (srcY * inW + srcX) * 4;
+            int dstIdx = (y * outW + x) * 4;
+            for(int i=0; i<4; i++) output[dstIdx + i] = input[srcIdx + i];
+        }
+    }
+}
 
 int main(int argc, char** argv) {
-    std::cout << "--- Image Resizer (AMD FSR 1.0 CPU Port) ---" << std::endl;
+    std::cout << "--- Image Resizer CPU ---" << std::endl;
 
-    if (argc < 4) {
-        std::cout << "Usage: image-resizer.exe <input.png> <output.png> <scale> [sharpness]" << std::endl;
-        std::cout << "Sharpness: 0.0 (Max Sharp) to 2.0 (Soft). Default is 0.2" << std::endl;
+    std::string inputFile = "";
+    std::string outputFile = "";
+    float scale = 2.0f;
+    float sharpness = 0.2f;
+    std::string algo = "fsr"; // Default to FSR
+
+    // Parse command line flags
+    for(int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--scale" && i + 1 < argc) scale = std::stof(argv[++i]);
+        else if (arg == "--algo" && i + 1 < argc) algo = argv[++i];
+        else if (arg == "--sharpness" && i + 1 < argc) sharpness = std::stof(argv[++i]);
+        else if (inputFile.empty()) inputFile = arg;
+        else if (outputFile.empty()) outputFile = arg;
+    }
+
+    if (inputFile.empty() || outputFile.empty()) {
+        std::cout << "Usage: image-resizer.exe <in.png> <out.png> [--scale 2.0] [--algo fsr|nearest] [--sharpness 0.2]" << std::endl;
         return 1;
     }
 
-    const char* inputFile = argv[1];
-    const char* outputFile = argv[2];
-    float scale = std::stof(argv[3]);
-    
-    // Set default sharpness to 0.2, but allow the user to override it!
-    float sharpness = 0.2f;
-    if (argc > 4) {
-        sharpness = std::stof(argv[4]);
-    }
-
-    std::cout << "Loading: " << inputFile << "..." << std::endl;
-
     int width, height, channels;
-    unsigned char* imgData = stbi_load(inputFile, &width, &height, &channels, 4);
-
+    unsigned char* imgData = stbi_load(inputFile.c_str(), &width, &height, &channels, 4);
     if (!imgData) {
         std::cout << "Failed to load image!" << std::endl;
         return 1;
@@ -41,39 +53,28 @@ int main(int argc, char** argv) {
 
     int newW = (int)(width * scale);
     int newH = (int)(height * scale);
-
-    std::cout << "Scaling to: " << newW << "x" << newH << " (Scale: " << scale << "x)" << std::endl;
-    std::cout << "Sharpness level: " << sharpness << std::endl;
-
-    // Canvas 1: The smoothed EASU image
-    unsigned char* easuData = new unsigned char[newW * newH * 4];
-    
-    // Canvas 2: The final sharpened RCAS image
     unsigned char* finalData = new unsigned char[newW * newH * 4];
 
-    // PASS 1: Scale and Smooth
-    std::cout << "Pass 1: FSR EASU (Scaling)..." << std::endl;
-    scaleFSR_EASU(imgData, width, height, easuData, newW, newH);
-
-    // PASS 2: Sharpen and Restore Texture
-    std::cout << "Pass 2: FSR RCAS (Sharpening)..." << std::endl;
-    applyFSR_RCAS(easuData, newW, newH, finalData, sharpness);
-
-    std::cout << "Saving: " << outputFile << "..." << std::endl;
-    int stride = newW * 4;
-    int success = stbi_write_png(outputFile, newW, newH, 4, finalData, stride);
-
-    // Free all three memory blocks
-    stbi_image_free(imgData);
-    delete[] easuData;
-    delete[] finalData;
-
-    if (success) {
-        std::cout << "Image scaled and saved successfully!" << std::endl;
-    } else {
-        std::cout << "Failed to save image." << std::endl;
+    if (algo == "nearest") {
+        std::cout << "Processing (Nearest Neighbor)..." << std::endl;
+        scaleNearestNeighbor(imgData, width, height, finalData, newW, newH);
+    } 
+    else if (algo == "fsr") {
+        std::cout << "Processing (AMD FSR 1.0)..." << std::endl;
+        unsigned char* easuData = new unsigned char[newW * newH * 4];
+        scaleFSR_EASU(imgData, width, height, easuData, newW, newH);
+        applyFSR_RCAS(easuData, newW, newH, finalData, sharpness);
+        delete[] easuData;
+    } 
+    else {
+        std::cout << "Unknown algorithm: " << algo << std::endl;
         return 1;
     }
 
+    std::cout << "Saving: " << outputFile << std::endl;
+    stbi_write_png(outputFile.c_str(), newW, newH, 4, finalData, newW * 4);
+
+    stbi_image_free(imgData);
+    delete[] finalData;
     return 0;
 }
