@@ -19,14 +19,70 @@ float sampleAlpha(const unsigned char* data, int w, int h, int x, int y) {
     return data[idx+3] / 255.0f;
 }
 
+// EXACT AMD FSR LUMA FORMULA
 float getLuma(float3 c) {
-    return c.x * 0.299f + c.y * 0.587f + c.z * 0.114f;
+    return c.x * 0.5f + c.y * 1.0f + c.z * 0.5f;
 }
 
 // --------------------------------------------------------------------------
-// THE CORE FSR 1.0 ALGORITHM (EASU) - EXACT AMD POLYNOMIAL
+// EXACT AMD EASU EDGE ACCUMULATION (FsrEasuSetF)
 // --------------------------------------------------------------------------
+void FsrEasuSetF(float2& dir, float& len, float2 pp, bool biS, bool biT, bool biU, bool biV, 
+                 float lA, float lB, float lC, float lD, float lE) {
+    float w = 0.0f;
+    if (biS) w = (1.0f - pp.x) * (1.0f - pp.y);
+    if (biT) w = pp.x * (1.0f - pp.y);
+    if (biU) w = (1.0f - pp.x) * pp.y;
+    if (biV) w = pp.x * pp.y;
 
+    float dc = lD - lC;
+    float cb = lC - lB;
+    float lenX = std::max(std::abs(dc), std::abs(cb));
+    lenX = 1.0f / std::max(lenX, 1e-6f); // Protect against /0
+    float dirX = lD - lB;
+    dir.x += dirX * w;
+    lenX = clamp(std::abs(dirX) * lenX, 0.0f, 1.0f);
+    lenX *= lenX;
+    len += lenX * w;
+
+    float ec = lE - lC;
+    float ca = lC - lA;
+    float lenY = std::max(std::abs(ec), std::abs(ca));
+    lenY = 1.0f / std::max(lenY, 1e-6f);
+    float dirY = lE - lA;
+    dir.y += dirY * w;
+    lenY = clamp(std::abs(dirY) * lenY, 0.0f, 1.0f);
+    lenY *= lenY;
+    len += lenY * w;
+}
+
+// --------------------------------------------------------------------------
+// EXACT AMD EASU TAP FILTER (FsrEasuTapF)
+// --------------------------------------------------------------------------
+void FsrEasuTapF(float3& aC, float& aW, float2 off, float2 dir, float2 len2, float lob, float clp, float3 c) {
+    float2 v;
+    v.x = (off.x * dir.x) + (off.y * dir.y);
+    v.y = (off.x * -dir.y) + (off.y * dir.x);
+    v.x *= len2.x;
+    v.y *= len2.y;
+    
+    float d2 = v.x * v.x + v.y * v.y;
+    d2 = std::min(d2, clp);
+    
+    float wB = (2.0f / 5.0f) * d2 - 1.0f;
+    float wA = lob * d2 - 1.0f;
+    wB *= wB;
+    wA *= wA;
+    wB = (25.0f / 16.0f) * wB - (25.0f / 16.0f - 1.0f);
+    
+    float w = wB * wA;
+    aC = aC + c * w;
+    aW += w;
+}
+
+// --------------------------------------------------------------------------
+// THE CORE FSR 1.0 ALGORITHM (FsrEasuF)
+// --------------------------------------------------------------------------
 void scaleFSR_EASU(const unsigned char* input, int inW, int inH, 
                    unsigned char* output, int outW, int outH) {
     
@@ -35,78 +91,78 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
             
             float srcX = ((x + 0.5f) * inW) / outW - 0.5f;
             float srcY = ((y + 0.5f) * inH) / outH - 0.5f;
-            
             int ix = (int)std::floor(srcX);
             int iy = (int)std::floor(srcY);
-            float fx = srcX - ix;
-            float fy = srcY - iy;
+            float2 pp = float2(srcX - ix, srcY - iy);
 
-            float lumaN = getLuma(sampleRGB(input, inW, inH, ix, iy - 1));
-            float lumaS = getLuma(sampleRGB(input, inW, inH, ix, iy + 2));
-            float lumaE = getLuma(sampleRGB(input, inW, inH, ix + 2, iy));
-            float lumaW = getLuma(sampleRGB(input, inW, inH, ix - 1, iy));
-            float lumaC = getLuma(sampleRGB(input, inW, inH, ix, iy)); 
-            
-            float dirX = lumaE - lumaW;
-            float dirY = lumaS - lumaN;
-            
-            float dirLen = std::sqrt(dirX * dirX + dirY * dirY);
-            if (dirLen > 0.0001f) {
-                dirX /= dirLen;
-                dirY /= dirLen;
-            } else {
-                dirX = 1.0f;
-                dirY = 0.0f;
-            }
-            
-            float stretchX = 1.0f + dirLen * 2.0f; 
-            float stretchY = 1.0f;                 
-            
-            float3 totalColor(0.0f);
-            float totalAlpha = 0.0f;
-            float totalWeight = 0.0f;
-            
-            for (int dy = -1; dy <= 2; ++dy) {
-                for (int dx = -1; dx <= 2; ++dx) {
-                    
-                    float distX = dx - fx;
-                    float distY = dy - fy;
-                    
-                    float rotatedX = (dirX * distX + dirY * distY) * stretchX;
-                    float rotatedY = (-dirY * distX + dirX * distY) * stretchY;
-                    
-                    float d2 = rotatedX * rotatedX + rotatedY * rotatedY;
-                    
-                    // CRITICAL FIX: EXACT AMD EASU WINDOW WEIGHT MATH
-                    // AMD uses a custom windowed polynomial: w = (0.5 * d^2 - 1.0) * d^2 + 1.0
-                    // This creates a much tighter, sharper sample than standard approximations.
-                    if (d2 < 2.0f) { // AMD clamps the max radius tight
-                        float w = (0.5f * d2 - 1.0f) * d2 + 1.0f;
-                        w = std::max(0.0f, w); // Ensure weight doesn't go negative
-                        
-                        float3 color = sampleRGB(input, inW, inH, ix + dx, iy + dy);
-                        float alpha = sampleAlpha(input, inW, inH, ix + dx, iy + dy);
-                        
-                        totalColor = totalColor + color * w;
-                        totalAlpha += alpha * w;
-                        totalWeight += w;
-                    }
-                }
-            }
-            
-            if (totalWeight > 0.0f) {
-                totalColor = totalColor * (1.0f / totalWeight);
-                totalAlpha = totalAlpha / totalWeight;
-            }
-            
-            totalColor = clamp(totalColor, float3(0.0f), float3(1.0f));
-            totalAlpha = saturate(totalAlpha);
-            
+            // Fetch the 12-tap grid
+            float3 b = sampleRGB(input, inW, inH, ix,   iy-1);
+            float3 c = sampleRGB(input, inW, inH, ix+1, iy-1);
+            float3 e = sampleRGB(input, inW, inH, ix-1, iy);
+            float3 f = sampleRGB(input, inW, inH, ix,   iy);
+            float3 g = sampleRGB(input, inW, inH, ix+1, iy);
+            float3 h = sampleRGB(input, inW, inH, ix+2, iy);
+            float3 i = sampleRGB(input, inW, inH, ix-1, iy+1);
+            float3 j = sampleRGB(input, inW, inH, ix,   iy+1);
+            float3 k = sampleRGB(input, inW, inH, ix+1, iy+1);
+            float3 l = sampleRGB(input, inW, inH, ix+2, iy+1);
+            float3 n = sampleRGB(input, inW, inH, ix,   iy+2);
+            float3 o = sampleRGB(input, inW, inH, ix+1, iy+2);
+
+            float bL = getLuma(b); float cL = getLuma(c);
+            float eL = getLuma(e); float fL = getLuma(f); float gL = getLuma(g); float hL = getLuma(h);
+            float iL = getLuma(i); float jL = getLuma(j); float kL = getLuma(k); float lL = getLuma(l);
+            float nL = getLuma(n); float oL = getLuma(o);
+
+            float2 dir(0.0f);
+            float len = 0.0f;
+            FsrEasuSetF(dir, len, pp, true, false, false, false, bL, eL, fL, gL, jL);
+            FsrEasuSetF(dir, len, pp, false, true, false, false, cL, fL, gL, hL, kL);
+            FsrEasuSetF(dir, len, pp, false, false, true, false, fL, iL, jL, kL, nL);
+            FsrEasuSetF(dir, len, pp, false, false, false, true, gL, jL, kL, lL, oL);
+
+            float dirR = dir.x * dir.x + dir.y * dir.y;
+            bool zro = dirR < (1.0f / 32768.0f);
+            dirR = 1.0f / std::sqrt(std::max(dirR, 1e-6f));
+            dirR = zro ? 1.0f : dirR;
+            dir.x = zro ? 1.0f : dir.x;
+            dir.x *= dirR;
+            dir.y *= dirR;
+
+            len = len * 0.5f;
+            len *= len;
+            float stretch = (dir.x * dir.x + dir.y * dir.y) / std::max(std::max(std::abs(dir.x), std::abs(dir.y)), 1e-6f);
+            float2 len2 = float2(1.0f + (stretch - 1.0f) * len, 1.0f - 0.5f * len);
+            float lob = 0.5f + ((1.0f / 4.0f - 0.04f) - 0.5f) * len;
+            float clp = 1.0f / lob;
+
+            float3 min4 = min(min(f, g), min(j, k));
+            float3 max4 = max(max(f, g), max(j, k));
+
+            float3 aC(0.0f);
+            float aW = 0.0f;
+            FsrEasuTapF(aC, aW, float2( 0.0f, -1.0f) - pp, dir, len2, lob, clp, b);
+            FsrEasuTapF(aC, aW, float2( 1.0f, -1.0f) - pp, dir, len2, lob, clp, c);
+            FsrEasuTapF(aC, aW, float2(-1.0f,  0.0f) - pp, dir, len2, lob, clp, e);
+            FsrEasuTapF(aC, aW, float2( 0.0f,  0.0f) - pp, dir, len2, lob, clp, f);
+            FsrEasuTapF(aC, aW, float2( 1.0f,  0.0f) - pp, dir, len2, lob, clp, g);
+            FsrEasuTapF(aC, aW, float2( 2.0f,  0.0f) - pp, dir, len2, lob, clp, h);
+            FsrEasuTapF(aC, aW, float2(-1.0f,  1.0f) - pp, dir, len2, lob, clp, i);
+            FsrEasuTapF(aC, aW, float2( 0.0f,  1.0f) - pp, dir, len2, lob, clp, j);
+            FsrEasuTapF(aC, aW, float2( 1.0f,  1.0f) - pp, dir, len2, lob, clp, k);
+            FsrEasuTapF(aC, aW, float2( 2.0f,  1.0f) - pp, dir, len2, lob, clp, l);
+            FsrEasuTapF(aC, aW, float2( 0.0f,  2.0f) - pp, dir, len2, lob, clp, n);
+            FsrEasuTapF(aC, aW, float2( 1.0f,  2.0f) - pp, dir, len2, lob, clp, o);
+
+            float3 finalColor = aC * (1.0f / std::max(aW, 1e-6f));
+            finalColor = clamp(finalColor, min4, max4);
+            float alpha = sampleAlpha(input, inW, inH, ix, iy); // Center Alpha
+
             int dstIndex = (y * outW + x) * 4;
-            output[dstIndex + 0] = (unsigned char)(totalColor.x * 255.0f);
-            output[dstIndex + 1] = (unsigned char)(totalColor.y * 255.0f);
-            output[dstIndex + 2] = (unsigned char)(totalColor.z * 255.0f);
-            output[dstIndex + 3] = (unsigned char)(totalAlpha * 255.0f);
+            output[dstIndex + 0] = (unsigned char)(finalColor.x * 255.0f);
+            output[dstIndex + 1] = (unsigned char)(finalColor.y * 255.0f);
+            output[dstIndex + 2] = (unsigned char)(finalColor.z * 255.0f);
+            output[dstIndex + 3] = (unsigned char)(alpha * 255.0f);
         }
     }
 }
