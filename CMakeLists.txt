@@ -11,7 +11,7 @@ file(DOWNLOAD "https://raw.githubusercontent.com/nothings/stb/master/stb_image_w
 include_directories(${STB_DIR})
 
 # Notice we added src/stb.cpp to the list of files to compile!
-add_executable(image-resizer src/main.cpp src/stb.cpp)
+add_executable(image-resizer src/main.cpp src/stb.cpp src/fsr_easu.cpp)
 
 if(MSVC)
     set_property(TARGET image-resizer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
