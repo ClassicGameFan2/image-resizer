@@ -55,8 +55,10 @@ void applyFSR_RCAS(const unsigned char* input, int w, int h,
             float3 lobeRGB = max(-hitMin, hitMax);
             float lobe = std::max(-FSR_RCAS_LIMIT, std::min(std::max(lobeRGB.x, std::max(lobeRGB.y, lobeRGB.z)), 0.0f)) * sharpConfig;
 
+            // BUG FIX: The AMD CLI does not use FSR_RCAS_DENOISE! 
+            // By commenting this out, we unleash the full sharpening power.
             // Apply noise removal
-            lobe *= nz;
+            // lobe *= nz;
 
             // Resolve
             float rcpL = 1.0f / (4.0f * lobe + 1.0f);
