@@ -159,10 +159,11 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
             float alpha = sampleAlpha(input, inW, inH, ix, iy); // Center Alpha
 
             int dstIndex = (y * outW + x) * 4;
-            output[dstIndex + 0] = (unsigned char)(finalColor.x * 255.0f);
-            output[dstIndex + 1] = (unsigned char)(finalColor.y * 255.0f);
-            output[dstIndex + 2] = (unsigned char)(finalColor.z * 255.0f);
-            output[dstIndex + 3] = (unsigned char)(alpha * 255.0f);
+            // ADD + 0.5f for perfect color rounding!
+            output[dstIndex + 0] = (unsigned char)(finalColor.x * 255.0f + 0.5f);
+            output[dstIndex + 1] = (unsigned char)(finalColor.y * 255.0f + 0.5f);
+            output[dstIndex + 2] = (unsigned char)(finalColor.z * 255.0f + 0.5f);
+            output[dstIndex + 3] = (unsigned char)(alpha * 255.0f + 0.5f);
         }
     }
 }
