@@ -14,9 +14,9 @@ extern float getLuma(float3 c);
 // --------------------------------------------------------------------------
 // EXACT AMD RCAS ALGORITHM (FsrRcasF)
 // --------------------------------------------------------------------------
-void applyFSR_RCAS(const unsigned char* input, int w, int h, 
-                   unsigned char* output, float sharpness) {
-    
+void applyFSR_RCAS(const unsigned char* input, int w, int h, unsigned char* output, 
+                   float sharpness, bool useDenoise, float lfga, bool useTepd) {
+
     // Convert sharpness from stops to linear value.
     float sharpConfig = std::exp2(-sharpness);
 
@@ -55,16 +55,17 @@ void applyFSR_RCAS(const unsigned char* input, int w, int h,
             float3 lobeRGB = max(-hitMin, hitMax);
             float lobe = std::max(-FSR_RCAS_LIMIT, std::min(std::max(lobeRGB.x, std::max(lobeRGB.y, lobeRGB.z)), 0.0f)) * sharpConfig;
 
-            // BUG FIX: The AMD CLI does not use FSR_RCAS_DENOISE! 
-            // By commenting this out, we unleash the full sharpening power.
-            // Apply noise removal
-            // lobe *= nz;
+            // OPTIONAL RCAS DENOISE
+            if (useDenoise) lobe *= nz; 
 
             // Resolve
             float rcpL = 1.0f / (4.0f * lobe + 1.0f);
             float3 finalColor = (b * lobe + d * lobe + h_ * lobe + f * lobe + e) * rcpL;
-            
             finalColor = clamp(finalColor, float3(0.0f), float3(1.0f));
+            
+            // APPLY POST-PROCESSING
+            finalColor = applyPostProcess(finalColor, x, y, lfga, useTepd);
+            
             float alpha = sampleAlpha(input, w, h, x, y);
 
             int dstIndex = (y * w + x) * 4;
