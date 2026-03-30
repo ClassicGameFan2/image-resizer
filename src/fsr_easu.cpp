@@ -76,11 +76,12 @@ void FsrEasuTapF(float3& aC, float& aA, float& aW, float2 off, float2 dir, float
 }
 
 void scaleFSR_EASU(const unsigned char* input, int inW, int inH, 
-                   unsigned char* output, int outW, int outH) {
+                   unsigned char* output, int outW, int outH, float lfga, bool useTepd) {
     
     for (int y = 0; y < outH; ++y) {
         for (int x = 0; x < outW; ++x) {
             
+            // ... (Keep the exact same math here as before) ...
             float srcX = ((x + 0.5f) * inW) / outW - 0.5f;
             float srcY = ((y + 0.5f) * inH) / outH - 0.5f;
             int ix = (int)std::floor(srcX);
@@ -152,6 +153,9 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
             float3 finalColor = aC * rcpWeight;
             finalColor = clamp(finalColor, min4, max4);
             
+            // APPLY POST-PROCESSING
+            finalColor = applyPostProcess(finalColor, x, y, lfga, useTepd);
+
             float finalAlpha = aA * rcpWeight;
             finalAlpha = clamp(finalAlpha, min4A, max4A);
 
