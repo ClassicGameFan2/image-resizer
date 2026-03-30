@@ -119,7 +119,7 @@ bool saveIndexedPNG(const char* filename, const unsigned char* indexedData, int 
     
     for (const auto& c : palette) {
         lodepng_palette_add(&state.info_png.color, c.r, c.g, c.b, c.a);
-        lodepng_palette_add(&state.info_raw.color, c.r, c.g, c.b, c.a);
+        lodepng_palette_add(&state.info_raw, c.r, c.g, c.b, c.a); // <-- FIXED TYPO HERE!
     }
     
     std::vector<unsigned char> buffer;
