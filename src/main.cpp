@@ -3,6 +3,7 @@
 #include <vector>
 #include <filesystem>
 #include <algorithm>
+#include <cstring> // Needed for memcpy
 #include "stb_image.h"
 #include "stb_image_write.h"
 
@@ -26,46 +27,59 @@ bool processImage(const std::string& inFile, const std::string& outFile, float s
         return false;
     }
 
-    int newW = std::max(1, (int)(width * scale));
-    int newH = std::max(1, (int)(height * scale));
-    unsigned char* finalData = new unsigned char[newW * newH * 4];
+    // Step 1: Base Resolution Logic
+    int newW = width;
+    int newH = height;
+    
+    if (algo != "off") {
+        newW = std::max(1, (int)(width * scale));
+        newH = std::max(1, (int)(height * scale));
+    }
 
-    if (algo == "nearest") {
-        scaleNearestNeighbor(imgData, width, height, finalData, newW, newH);
+    unsigned char* step1Data = new unsigned char[newW * newH * 4];
+
+    // Step 2: The Scaling Pass
+    if (algo == "off") {
+        std::memcpy(step1Data, imgData, newW * newH * 4); // Just copy the original pixels
+    }
+    else if (algo == "nearest") {
+        scaleNearestNeighbor(imgData, width, height, step1Data, newW, newH);
     } 
     else if (algo == "bilinear") {
-        scaleBilinear(imgData, width, height, finalData, newW, newH);
+        scaleBilinear(imgData, width, height, step1Data, newW, newH);
     }
     else if (algo == "bicubic") {
-        scaleBicubic(imgData, width, height, finalData, newW, newH);
+        scaleBicubic(imgData, width, height, step1Data, newW, newH);
     }
     else if (algo == "lanczos3") {
-        scaleLanczos3(imgData, width, height, finalData, newW, newH);
+        scaleLanczos3(imgData, width, height, step1Data, newW, newH);
     }
     else if (algo == "fsr") {
         if (scale < 1.0f) {
-            std::cout << "Error: FSR 1.0 mathematically cannot downscale. Please use --algo bicubic or lanczos3 for downscaling." << std::endl;
+            std::cout << "Error: FSR 1.0 mathematically cannot downscale. Please use --algo bicubic or lanczos3." << std::endl;
             stbi_image_free(imgData);
-            delete[] finalData;
+            delete[] step1Data;
             return false;
         }
-
-        if (useRcas) {
-            unsigned char* easuData = new unsigned char[newW * newH * 4];
-            scaleFSR_EASU(imgData, width, height, easuData, newW, newH);
-            applyFSR_RCAS(easuData, newW, newH, finalData, sharpness);
-            delete[] easuData;
-        } else {
-            scaleFSR_EASU(imgData, width, height, finalData, newW, newH);
-        }
+        scaleFSR_EASU(imgData, width, height, step1Data, newW, newH);
     } 
     else {
         std::cout << "Unknown algorithm: " << algo << std::endl;
         stbi_image_free(imgData);
-        delete[] finalData;
+        delete[] step1Data;
         return false;
     }
 
+    // Step 3: The Optional RCAS Sharpening Pass
+    unsigned char* finalData = step1Data; // Assume no RCAS initially
+
+    if (useRcas) {
+        finalData = new unsigned char[newW * newH * 4];
+        applyFSR_RCAS(step1Data, newW, newH, finalData, sharpness);
+        delete[] step1Data; // Free the unsharpened memory
+    }
+
+    // Step 4: Save
     stbi_write_png(outFile.c_str(), newW, newH, 4, finalData, newW * 4);
 
     stbi_image_free(imgData);
@@ -82,7 +96,7 @@ int main(int argc, char** argv) {
     float scale = 2.0f;
     float sharpness = 0.2f;
     std::string algo = "fsr";
-    bool useRcas = true;
+    std::string rcasInput = "auto"; // Auto means ON for FSR, OFF for everything else
 
     for(int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -90,19 +104,22 @@ int main(int argc, char** argv) {
         else if (arg == "--algo" && i + 1 < argc) algo = argv[++i];
         else if (arg == "--sharpness" && i + 1 < argc) sharpness = std::stof(argv[++i]);
         else if (arg == "--suffix" && i + 1 < argc) suffix = argv[++i];
-        else if (arg == "--rcas" && i + 1 < argc) {
-            std::string rcasFlag = argv[++i];
-            useRcas = (rcasFlag == "on");
-        }
+        else if (arg == "--rcas" && i + 1 < argc) rcasInput = argv[++i];
         else if (inputPath.empty()) inputPath = arg;
         else if (outputPath.empty()) outputPath = arg;
     }
 
     if (inputPath.empty() || outputPath.empty()) {
         std::cout << "Usage: image-resizer.exe <in_path> <out_path> [options]" << std::endl;
-        std::cout << "Options: --scale 2.0 --algo fsr|nearest|bilinear|bicubic|lanczos3 --rcas on|off --sharpness 0.2 --suffix _hd" << std::endl;
+        std::cout << "Options: --scale 2.0 --algo fsr|nearest|bilinear|bicubic|lanczos3|off --rcas on|off --sharpness 0.2 --suffix _hd" << std::endl;
         return 1;
     }
+
+    // Determine RCAS behavior
+    bool useRcas = false;
+    if (rcasInput == "on") useRcas = true;
+    else if (rcasInput == "off") useRcas = false;
+    else if (algo == "fsr") useRcas = true; // Auto behavior: FSR defaults to RCAS ON
 
     if (fs::is_directory(inputPath)) {
         if (fs::exists(outputPath) && !fs::is_directory(outputPath)) {
