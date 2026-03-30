@@ -1,3 +1,4 @@
+#include "fsr_math.h"
 #include <cmath>
 #include <algorithm>
 
@@ -43,15 +44,12 @@ typedef double (*KernelFunc)(double);
 
 void processGenericResample(const unsigned char* input, int inW, int inH, 
                             unsigned char* output, int outW, int outH, 
-                            KernelFunc kernel, double baseRadius) {
+                            KernelFunc kernel, double baseRadius, float lfga, bool useTepd) {
     
     double scaleX = (double)outW / (double)inW;
     double scaleY = (double)outH / (double)inH;
-    
-    // If downscaling, we expand the filter radius to act as anti-aliasing
     double filterScaleX = std::min(1.0, scaleX);
     double filterScaleY = std::min(1.0, scaleY);
-    
     double radiusX = baseRadius / filterScaleX;
     double radiusY = baseRadius / filterScaleY;
 
@@ -69,14 +67,9 @@ void processGenericResample(const unsigned char* input, int inW, int inH,
             double weightSum = 0.0;
 
             for (int cy = yMin; cy <= yMax; ++cy) {
-                double dy = (srcY - cy) * filterScaleY;
-                double wy = kernel(dy);
-                
+                double wy = kernel((srcY - cy) * filterScaleY);
                 for (int cx = xMin; cx <= xMax; ++cx) {
-                    double dx = (srcX - cx) * filterScaleX;
-                    double wx = kernel(dx);
-                    
-                    double w = wx * wy;
+                    double w = kernel((srcX - cx) * filterScaleX) * wy;
                     int srcIdx = (cy * inW + cx) * 4;
                     r += input[srcIdx + 0] * w;
                     g += input[srcIdx + 1] * w;
@@ -86,12 +79,17 @@ void processGenericResample(const unsigned char* input, int inW, int inH,
                 }
             }
             
-            int dstIdx = (y * outW + x) * 4;
             if (weightSum > 0.0) {
-                output[dstIdx + 0] = clamp_byte(r / weightSum);
-                output[dstIdx + 1] = clamp_byte(g / weightSum);
-                output[dstIdx + 2] = clamp_byte(b / weightSum);
-                output[dstIdx + 3] = clamp_byte(a / weightSum);
+                float3 color((float)(r / weightSum / 255.0), (float)(g / weightSum / 255.0), (float)(b / weightSum / 255.0));
+                
+                // APPLY POST-PROCESSING TO STANDARD SCALERS!
+                color = applyPostProcess(color, x, y, lfga, useTepd);
+                
+                int dstIdx = (y * outW + x) * 4;
+                output[dstIdx + 0] = clamp_byte(color.x * 255.0f);
+                output[dstIdx + 1] = clamp_byte(color.y * 255.0f);
+                output[dstIdx + 2] = clamp_byte(color.z * 255.0f);
+                output[dstIdx + 3] = clamp_byte((a / weightSum));
             }
         }
     }
@@ -113,14 +111,12 @@ void scaleNearestNeighbor(const unsigned char* input, int inW, int inH, unsigned
     }
 }
 
-void scaleBilinear(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH) {
-    processGenericResample(input, inW, inH, output, outW, outH, weight_bilinear, 1.0);
+void scaleBilinear(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH, float lfga, bool tepd) {
+    processGenericResample(input, inW, inH, output, outW, outH, weight_bilinear, 1.0, lfga, tepd);
 }
-
-void scaleBicubic(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH) {
-    processGenericResample(input, inW, inH, output, outW, outH, weight_bicubic, 2.0);
+void scaleBicubic(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH, float lfga, bool tepd) {
+    processGenericResample(input, inW, inH, output, outW, outH, weight_bicubic, 2.0, lfga, tepd);
 }
-
-void scaleLanczos3(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH) {
-    processGenericResample(input, inW, inH, output, outW, outH, weight_lanczos3, 3.0);
+void scaleLanczos3(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH, float lfga, bool tepd) {
+    processGenericResample(input, inW, inH, output, outW, outH, weight_lanczos3, 3.0, lfga, tepd);
 }
