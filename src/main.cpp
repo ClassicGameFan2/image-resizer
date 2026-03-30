@@ -1,29 +1,23 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <filesystem> // C++17 Magic!
+#include <filesystem>
 #include <algorithm>
 #include "stb_image.h"
 #include "stb_image_write.h"
 
 namespace fs = std::filesystem;
 
+// FSR
 extern void scaleFSR_EASU(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH);
 extern void applyFSR_RCAS(const unsigned char* input, int w, int h, unsigned char* output, float sharpness);
 
-void scaleNearestNeighbor(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH) {
-    for (int y = 0; y < outH; ++y) {
-        for (int x = 0; x < outW; ++x) {
-            int srcX = (x * inW) / outW;
-            int srcY = (y * inH) / outH;
-            int srcIdx = (srcY * inW + srcX) * 4;
-            int dstIdx = (y * outW + x) * 4;
-            for(int i=0; i<4; i++) output[dstIdx + i] = input[srcIdx + i];
-        }
-    }
-}
+// Standard Scalers
+extern void scaleNearestNeighbor(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH);
+extern void scaleBilinear(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH);
+extern void scaleBicubic(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH);
+extern void scaleLanczos3(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH);
 
-// Reusable function to process a single image
 bool processImage(const std::string& inFile, const std::string& outFile, float scale, const std::string& algo, bool useRcas, float sharpness) {
     int width, height, channels;
     unsigned char* imgData = stbi_load(inFile.c_str(), &width, &height, &channels, 4);
@@ -32,14 +26,30 @@ bool processImage(const std::string& inFile, const std::string& outFile, float s
         return false;
     }
 
-    int newW = (int)(width * scale);
-    int newH = (int)(height * scale);
+    int newW = std::max(1, (int)(width * scale));
+    int newH = std::max(1, (int)(height * scale));
     unsigned char* finalData = new unsigned char[newW * newH * 4];
 
     if (algo == "nearest") {
         scaleNearestNeighbor(imgData, width, height, finalData, newW, newH);
     } 
+    else if (algo == "bilinear") {
+        scaleBilinear(imgData, width, height, finalData, newW, newH);
+    }
+    else if (algo == "bicubic") {
+        scaleBicubic(imgData, width, height, finalData, newW, newH);
+    }
+    else if (algo == "lanczos3") {
+        scaleLanczos3(imgData, width, height, finalData, newW, newH);
+    }
     else if (algo == "fsr") {
+        if (scale < 1.0f) {
+            std::cout << "Error: FSR 1.0 mathematically cannot downscale. Please use --algo bicubic or lanczos3 for downscaling." << std::endl;
+            stbi_image_free(imgData);
+            delete[] finalData;
+            return false;
+        }
+
         if (useRcas) {
             unsigned char* easuData = new unsigned char[newW * newH * 4];
             scaleFSR_EASU(imgData, width, height, easuData, newW, newH);
@@ -48,6 +58,12 @@ bool processImage(const std::string& inFile, const std::string& outFile, float s
         } else {
             scaleFSR_EASU(imgData, width, height, finalData, newW, newH);
         }
+    } 
+    else {
+        std::cout << "Unknown algorithm: " << algo << std::endl;
+        stbi_image_free(imgData);
+        delete[] finalData;
+        return false;
     }
 
     stbi_write_png(outFile.c_str(), newW, newH, 4, finalData, newW * 4);
@@ -68,7 +84,6 @@ int main(int argc, char** argv) {
     std::string algo = "fsr";
     bool useRcas = true;
 
-    // Parse command line flags
     for(int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--scale" && i + 1 < argc) scale = std::stof(argv[++i]);
@@ -84,54 +99,40 @@ int main(int argc, char** argv) {
     }
 
     if (inputPath.empty() || outputPath.empty()) {
-        std::cout << "Usage: image-resizer.exe <input_file_or_folder> <output_file_or_folder> [options]" << std::endl;
-        std::cout << "Options: --scale 2.0  --algo fsr|nearest  --rcas on|off  --sharpness 0.2  --suffix _hd" << std::endl;
+        std::cout << "Usage: image-resizer.exe <in_path> <out_path> [options]" << std::endl;
+        std::cout << "Options: --scale 2.0 --algo fsr|nearest|bilinear|bicubic|lanczos3 --rcas on|off --sharpness 0.2 --suffix _hd" << std::endl;
         return 1;
     }
 
-    // Check if input is a directory (Batch Mode)
     if (fs::is_directory(inputPath)) {
-        
-        // Safeguard: Output must be a directory
         if (fs::exists(outputPath) && !fs::is_directory(outputPath)) {
-            std::cout << "Error: Since input is a folder, output must also be a folder!" << std::endl;
+            std::cout << "Error: Output must be a folder!" << std::endl;
             return 1;
         }
-
-        // Safeguard: Input and Output cannot be the exact same folder
         if (fs::absolute(inputPath) == fs::absolute(outputPath)) {
-            std::cout << "Error: Input and Output folders cannot be the exact same directory!" << std::endl;
+            std::cout << "Error: Input and Output folders cannot be the same!" << std::endl;
             return 1;
         }
-
-        // Create output folder if it doesn't exist
-        if (!fs::exists(outputPath)) {
-            fs::create_directories(outputPath);
-        }
+        if (!fs::exists(outputPath)) fs::create_directories(outputPath);
 
         std::cout << "Batch Processing Folder: " << inputPath << std::endl;
         
-        // Iterate through files in the folder
         for (const auto& entry : fs::directory_iterator(inputPath)) {
             if (entry.is_regular_file()) {
                 std::string ext = entry.path().extension().string();
-                
-                // Convert extension to lowercase for safe checking
                 std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
                 
                 if (ext == ".png") {
                     std::string outName = entry.path().stem().string() + suffix + ".png";
                     std::string outFilePath = (fs::path(outputPath) / outName).string();
-                    
                     std::cout << " -> " << entry.path().filename().string() << std::endl;
                     processImage(entry.path().string(), outFilePath, scale, algo, useRcas, sharpness);
                 }
             }
         }
-        std::cout << "Batch Processing Complete!" << std::endl;
+        std::cout << "Batch Complete!" << std::endl;
     } 
     else {
-        // Single File Mode
         std::cout << "Processing Single File..." << std::endl;
         if (processImage(inputPath, outputPath, scale, algo, useRcas, sharpness)) {
             std::cout << "Success!" << std::endl;
