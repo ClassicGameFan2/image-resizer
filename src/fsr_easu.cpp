@@ -19,14 +19,10 @@ float sampleAlpha(const unsigned char* data, int w, int h, int x, int y) {
     return data[idx+3] / 255.0f;
 }
 
-// EXACT AMD FSR LUMA FORMULA
 float getLuma(float3 c) {
     return c.x * 0.5f + c.y * 1.0f + c.z * 0.5f;
 }
 
-// --------------------------------------------------------------------------
-// EXACT AMD EASU EDGE ACCUMULATION (FsrEasuSetF)
-// --------------------------------------------------------------------------
 void FsrEasuSetF(float2& dir, float& len, float2 pp, bool biS, bool biT, bool biU, bool biV, 
                  float lA, float lB, float lC, float lD, float lE) {
     float w = 0.0f;
@@ -38,7 +34,7 @@ void FsrEasuSetF(float2& dir, float& len, float2 pp, bool biS, bool biT, bool bi
     float dc = lD - lC;
     float cb = lC - lB;
     float lenX = std::max(std::abs(dc), std::abs(cb));
-    lenX = 1.0f / std::max(lenX, 1e-6f); // Protect against /0
+    lenX = 1.0f / std::max(lenX, 1e-6f);
     float dirX = lD - lB;
     dir.x += dirX * w;
     lenX = clamp(std::abs(dirX) * lenX, 0.0f, 1.0f);
@@ -56,10 +52,8 @@ void FsrEasuSetF(float2& dir, float& len, float2 pp, bool biS, bool biT, bool bi
     len += lenY * w;
 }
 
-// --------------------------------------------------------------------------
-// EXACT AMD EASU TAP FILTER (FsrEasuTapF)
-// --------------------------------------------------------------------------
-void FsrEasuTapF(float3& aC, float& aW, float2 off, float2 dir, float2 len2, float lob, float clp, float3 c) {
+// UPDATE: Now takes aA (Accumulated Alpha) and alpha (Tap Alpha)
+void FsrEasuTapF(float3& aC, float& aA, float& aW, float2 off, float2 dir, float2 len2, float lob, float clp, float3 c, float alpha) {
     float2 v;
     v.x = (off.x * dir.x) + (off.y * dir.y);
     v.y = (off.x * -dir.y) + (off.y * dir.x);
@@ -77,12 +71,10 @@ void FsrEasuTapF(float3& aC, float& aW, float2 off, float2 dir, float2 len2, flo
     
     float w = wB * wA;
     aC = aC + c * w;
+    aA += alpha * w; // Accumulate the Alpha!
     aW += w;
 }
 
-// --------------------------------------------------------------------------
-// THE CORE FSR 1.0 ALGORITHM (FsrEasuF)
-// --------------------------------------------------------------------------
 void scaleFSR_EASU(const unsigned char* input, int inW, int inH, 
                    unsigned char* output, int outW, int outH) {
     
@@ -95,19 +87,18 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
             int iy = (int)std::floor(srcY);
             float2 pp = float2(srcX - ix, srcY - iy);
 
-            // Fetch the 12-tap grid
-            float3 b = sampleRGB(input, inW, inH, ix,   iy-1);
-            float3 c = sampleRGB(input, inW, inH, ix+1, iy-1);
-            float3 e = sampleRGB(input, inW, inH, ix-1, iy);
-            float3 f = sampleRGB(input, inW, inH, ix,   iy);
-            float3 g = sampleRGB(input, inW, inH, ix+1, iy);
-            float3 h = sampleRGB(input, inW, inH, ix+2, iy);
-            float3 i = sampleRGB(input, inW, inH, ix-1, iy+1);
-            float3 j = sampleRGB(input, inW, inH, ix,   iy+1);
-            float3 k = sampleRGB(input, inW, inH, ix+1, iy+1);
-            float3 l = sampleRGB(input, inW, inH, ix+2, iy+1);
-            float3 n = sampleRGB(input, inW, inH, ix,   iy+2);
-            float3 o = sampleRGB(input, inW, inH, ix+1, iy+2);
+            float3 b = sampleRGB(input, inW, inH, ix,   iy-1); float bA = sampleAlpha(input, inW, inH, ix,   iy-1);
+            float3 c = sampleRGB(input, inW, inH, ix+1, iy-1); float cA = sampleAlpha(input, inW, inH, ix+1, iy-1);
+            float3 e = sampleRGB(input, inW, inH, ix-1, iy);   float eA = sampleAlpha(input, inW, inH, ix-1, iy);
+            float3 f = sampleRGB(input, inW, inH, ix,   iy);   float fA = sampleAlpha(input, inW, inH, ix,   iy);
+            float3 g = sampleRGB(input, inW, inH, ix+1, iy);   float gA = sampleAlpha(input, inW, inH, ix+1, iy);
+            float3 h = sampleRGB(input, inW, inH, ix+2, iy);   float hA = sampleAlpha(input, inW, inH, ix+2, iy);
+            float3 i = sampleRGB(input, inW, inH, ix-1, iy+1); float iA = sampleAlpha(input, inW, inH, ix-1, iy+1);
+            float3 j = sampleRGB(input, inW, inH, ix,   iy+1); float jA = sampleAlpha(input, inW, inH, ix,   iy+1);
+            float3 k = sampleRGB(input, inW, inH, ix+1, iy+1); float kA = sampleAlpha(input, inW, inH, ix+1, iy+1);
+            float3 l = sampleRGB(input, inW, inH, ix+2, iy+1); float lA = sampleAlpha(input, inW, inH, ix+2, iy+1);
+            float3 n = sampleRGB(input, inW, inH, ix,   iy+2); float nA = sampleAlpha(input, inW, inH, ix,   iy+2);
+            float3 o = sampleRGB(input, inW, inH, ix+1, iy+2); float oA = sampleAlpha(input, inW, inH, ix+1, iy+2);
 
             float bL = getLuma(b); float cL = getLuma(c);
             float eL = getLuma(e); float fL = getLuma(f); float gL = getLuma(g); float hL = getLuma(h);
@@ -138,32 +129,37 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
 
             float3 min4 = min(min(f, g), min(j, k));
             float3 max4 = max(max(f, g), max(j, k));
+            float min4A = std::min(std::min(fA, gA), std::min(jA, kA));
+            float max4A = std::max(std::max(fA, gA), std::max(jA, kA));
 
             float3 aC(0.0f);
+            float aA = 0.0f;
             float aW = 0.0f;
-            FsrEasuTapF(aC, aW, float2( 0.0f, -1.0f) - pp, dir, len2, lob, clp, b);
-            FsrEasuTapF(aC, aW, float2( 1.0f, -1.0f) - pp, dir, len2, lob, clp, c);
-            FsrEasuTapF(aC, aW, float2(-1.0f,  0.0f) - pp, dir, len2, lob, clp, e);
-            FsrEasuTapF(aC, aW, float2( 0.0f,  0.0f) - pp, dir, len2, lob, clp, f);
-            FsrEasuTapF(aC, aW, float2( 1.0f,  0.0f) - pp, dir, len2, lob, clp, g);
-            FsrEasuTapF(aC, aW, float2( 2.0f,  0.0f) - pp, dir, len2, lob, clp, h);
-            FsrEasuTapF(aC, aW, float2(-1.0f,  1.0f) - pp, dir, len2, lob, clp, i);
-            FsrEasuTapF(aC, aW, float2( 0.0f,  1.0f) - pp, dir, len2, lob, clp, j);
-            FsrEasuTapF(aC, aW, float2( 1.0f,  1.0f) - pp, dir, len2, lob, clp, k);
-            FsrEasuTapF(aC, aW, float2( 2.0f,  1.0f) - pp, dir, len2, lob, clp, l);
-            FsrEasuTapF(aC, aW, float2( 0.0f,  2.0f) - pp, dir, len2, lob, clp, n);
-            FsrEasuTapF(aC, aW, float2( 1.0f,  2.0f) - pp, dir, len2, lob, clp, o);
+            FsrEasuTapF(aC, aA, aW, float2( 0.0f, -1.0f) - pp, dir, len2, lob, clp, b, bA);
+            FsrEasuTapF(aC, aA, aW, float2( 1.0f, -1.0f) - pp, dir, len2, lob, clp, c, cA);
+            FsrEasuTapF(aC, aA, aW, float2(-1.0f,  0.0f) - pp, dir, len2, lob, clp, e, eA);
+            FsrEasuTapF(aC, aA, aW, float2( 0.0f,  0.0f) - pp, dir, len2, lob, clp, f, fA);
+            FsrEasuTapF(aC, aA, aW, float2( 1.0f,  0.0f) - pp, dir, len2, lob, clp, g, gA);
+            FsrEasuTapF(aC, aA, aW, float2( 2.0f,  0.0f) - pp, dir, len2, lob, clp, h, hA);
+            FsrEasuTapF(aC, aA, aW, float2(-1.0f,  1.0f) - pp, dir, len2, lob, clp, i, iA);
+            FsrEasuTapF(aC, aA, aW, float2( 0.0f,  1.0f) - pp, dir, len2, lob, clp, j, jA);
+            FsrEasuTapF(aC, aA, aW, float2( 1.0f,  1.0f) - pp, dir, len2, lob, clp, k, kA);
+            FsrEasuTapF(aC, aA, aW, float2( 2.0f,  1.0f) - pp, dir, len2, lob, clp, l, lA);
+            FsrEasuTapF(aC, aA, aW, float2( 0.0f,  2.0f) - pp, dir, len2, lob, clp, n, nA);
+            FsrEasuTapF(aC, aA, aW, float2( 1.0f,  2.0f) - pp, dir, len2, lob, clp, o, oA);
 
-            float3 finalColor = aC * (1.0f / std::max(aW, 1e-6f));
+            float rcpWeight = 1.0f / std::max(aW, 1e-6f);
+            float3 finalColor = aC * rcpWeight;
             finalColor = clamp(finalColor, min4, max4);
-            float alpha = sampleAlpha(input, inW, inH, ix, iy); // Center Alpha
+            
+            float finalAlpha = aA * rcpWeight;
+            finalAlpha = clamp(finalAlpha, min4A, max4A);
 
             int dstIndex = (y * outW + x) * 4;
-            // ADD + 0.5f for perfect color rounding!
             output[dstIndex + 0] = (unsigned char)(finalColor.x * 255.0f + 0.5f);
             output[dstIndex + 1] = (unsigned char)(finalColor.y * 255.0f + 0.5f);
             output[dstIndex + 2] = (unsigned char)(finalColor.z * 255.0f + 0.5f);
-            output[dstIndex + 3] = (unsigned char)(alpha * 255.0f + 0.5f);
+            output[dstIndex + 3] = (unsigned char)(finalAlpha * 255.0f + 0.5f);
         }
     }
 }
