@@ -74,3 +74,35 @@ inline float3 max(const float3& a, const float3& b) {
 inline float3 clamp(const float3& v, const float3& minVal, const float3& maxVal) {
     return float3(clamp(v.x, minVal.x, maxVal.x), clamp(v.y, minVal.y, maxVal.y), clamp(v.z, minVal.z, maxVal.z));
 }
+
+inline float fract(float x) { 
+    return x - std::floor(x); 
+}
+
+// --------------------------------------------------------
+// AMD POST-PROCESSING (LFGA & TEPD)
+// --------------------------------------------------------
+inline float3 applyPostProcess(float3 color, int x, int y, float lfga, bool tepd) {
+    // 1. AMD Linear Film Grain Applicator (LFGA)
+    if (lfga > 0.0f) {
+        // Fast, deterministic spatial noise generator
+        float noise = fract(std::sin(x * 12.9898f + y * 78.233f) * 43758.5453f) - 0.5f;
+        color.x += (noise * lfga) * std::min(1.0f - color.x, color.x);
+        color.y += (noise * lfga) * std::min(1.0f - color.y, color.y);
+        color.z += (noise * lfga) * std::min(1.0f - color.z, color.z);
+    }
+    
+    // 2. AMD Temporal Energy Preserving Dither (TEPD)
+    if (tepd) {
+        float dit = fract(x * 1.61803398875f + y * 0.27100271f);
+        auto applyDither = [&](float c) {
+            float n = std::floor(c * 255.0f) * (1.0f / 255.0f);
+            float r = (c - n) * 255.0f;
+            return saturate(n + (dit < r ? (1.0f / 255.0f) : 0.0f));
+        };
+        color.x = applyDither(color.x);
+        color.y = applyDither(color.y);
+        color.z = applyDither(color.z);
+    }
+    return color;
+}
