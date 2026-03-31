@@ -20,16 +20,38 @@ extern void scaleLanczos3(const unsigned char* input, int inW, int inH, unsigned
 
 bool processImage(const std::string& inFile, const std::string& outFile, float scale, const std::string& algo, 
                   bool useRcas, float sharpness, bool rcasDenoise, float lfga, bool tepd, int bpp,
-                  bool paletteMatch, const std::string& paletteDither) {
+                  const std::string& paletteMatch, const std::string& paletteDither, const std::string& matchPaletteFrom) {
                   
-    // --- PHASE 4: EXACT PALETTE EXTRACTION ---
-    std::vector<ColorRGBA> originalPalette;
+    // --- SMART PALETTE LOGIC ---
+    std::vector<ColorRGBA> targetPalette;
     bool hasTransparency = false;
-    
-    if (bpp == 8 && paletteMatch) {
-        if (!loadOriginalPalette(inFile, originalPalette, hasTransparency)) {
-            std::cout << "Error: Input image is NOT an 8-bit indexed PNG! Cannot palette-match." << std::endl;
-            return false;
+    bool shouldMatch = false;
+
+    if (bpp == 8) {
+        if (!matchPaletteFrom.empty()) {
+            // Priority 1: User specified an external file to rip the palette from
+            if (!loadOriginalPalette(matchPaletteFrom, targetPalette, hasTransparency)) {
+                std::cout << "Error: Could not load palette from " << matchPaletteFrom << std::endl;
+                return false;
+            }
+            shouldMatch = true;
+        } else {
+            // Check if input is 8-bit
+            bool is8Bit = loadOriginalPalette(inFile, targetPalette, hasTransparency);
+            
+            if (paletteMatch == "on") {
+                if (!is8Bit) {
+                    std::cout << "Error: --palette-match on requested, but input is not an 8-bit PNG." << std::endl;
+                    return false;
+                }
+                shouldMatch = true;
+            } else if (paletteMatch == "auto") {
+                // Priority 2: Auto mode. If input is 8-bit, keep the palette!
+                shouldMatch = is8Bit;
+            } else {
+                // Priority 3: "off". We will generate a brand new palette later.
+                shouldMatch = false;
+            }
         }
     }
 
@@ -71,23 +93,21 @@ bool processImage(const std::string& inFile, const std::string& outFile, float s
 
     // --- SAVING AND COLOR FORMATTING ---
     if (bpp == 8) {
-        if (!paletteMatch) {
-            std::cout << "Error: --bpp 8 currently requires --palette-match on to generate a valid palette!" << std::endl;
-            stbi_image_free(imgData); delete[] finalData; return false;
+        // If we didn't inherit a palette, GENERATE a new optimal 256-color palette!
+        if (!shouldMatch) {
+            generatePalette(finalData, newW, newH, targetPalette, hasTransparency);
         }
         
         unsigned char* indexedData = new unsigned char[newW * newH];
         bool useFS = (paletteDither == "fs");
         
-        quantizeAndDither(finalData, newW, newH, indexedData, originalPalette, hasTransparency, useFS);
-        saveIndexedPNG(outFile.c_str(), indexedData, newW, newH, originalPalette);
-        
+        quantizeAndDither(finalData, newW, newH, indexedData, targetPalette, hasTransparency, useFS);
+        saveIndexedPNG(outFile.c_str(), indexedData, newW, newH, targetPalette);
         delete[] indexedData;
     } 
     else {
         int outChannels = 4;
         unsigned char* saveBuffer = finalData;
-        
         if (bpp == 24) {
             outChannels = 3;
             saveBuffer = new unsigned char[newW * newH * 3];
@@ -110,9 +130,11 @@ int main(int argc, char** argv) {
     std::cout << "--- Image Resizer CPU ---" << std::endl;
 
     std::string inputPath = "", outputPath = "", suffix = "", algo = "fsr", rcasInput = "auto";
+    std::string paletteMatch = "auto";
+    std::string matchPaletteFrom = "";
     std::string paletteDither = "none";
     float scale = 2.0f, sharpness = 0.2f, lfga = 0.0f;
-    bool rcasDenoise = false, tepd = false, paletteMatch = false;
+    bool rcasDenoise = false, tepd = false;
     int bpp = 32;
 
     for(int i = 1; i < argc; i++) {
@@ -126,7 +148,8 @@ int main(int argc, char** argv) {
         else if (arg == "--lfga" && i + 1 < argc) lfga = std::stof(argv[++i]);
         else if (arg == "--tepd" && i + 1 < argc) tepd = (std::string(argv[++i]) == "on");
         else if (arg == "--bpp" && i + 1 < argc) bpp = std::stoi(argv[++i]);
-        else if (arg == "--palette-match" && i + 1 < argc) paletteMatch = (std::string(argv[++i]) == "on");
+        else if (arg == "--palette-match" && i + 1 < argc) paletteMatch = argv[++i];
+        else if (arg == "--match-palette-from" && i + 1 < argc) matchPaletteFrom = argv[++i];
         else if (arg == "--palette-dither" && i + 1 < argc) paletteDither = argv[++i];
         else if (inputPath.empty()) inputPath = arg;
         else if (outputPath.empty()) outputPath = arg;
@@ -136,7 +159,8 @@ int main(int argc, char** argv) {
         std::cout << "Usage: image-resizer <in> <out> [options]" << std::endl;
         std::cout << "Scale: --scale 2.0 --algo fsr|lanczos3|bicubic|nearest|off" << std::endl;
         std::cout << "PostFx: --rcas on|off --sharpness 0.2 --rcas-denoise on|off --lfga 0.0 --tepd on|off" << std::endl;
-        std::cout << "Output: --bpp 32|24|8 --palette-match on|off --palette-dither fs|none" << std::endl;
+        std::cout << "Output: --bpp 32|24|8 --suffix _hd" << std::endl;
+        std::cout << "8-Bit: --palette-match auto|on|off --match-palette-from <file> --palette-dither fs|none" << std::endl;
         return 1;
     }
 
@@ -148,11 +172,11 @@ int main(int argc, char** argv) {
             if (entry.is_regular_file() && entry.path().extension().string() == ".png") {
                 std::string outFilePath = (fs::path(outputPath) / (entry.path().stem().string() + suffix + ".png")).string();
                 std::cout << " -> " << entry.path().filename().string() << std::endl;
-                processImage(entry.path().string(), outFilePath, scale, algo, useRcas, sharpness, rcasDenoise, lfga, tepd, bpp, paletteMatch, paletteDither);
+                processImage(entry.path().string(), outFilePath, scale, algo, useRcas, sharpness, rcasDenoise, lfga, tepd, bpp, paletteMatch, paletteDither, matchPaletteFrom);
             }
         }
     } else {
-        processImage(inputPath, outputPath, scale, algo, useRcas, sharpness, rcasDenoise, lfga, tepd, bpp, paletteMatch, paletteDither);
+        processImage(inputPath, outputPath, scale, algo, useRcas, sharpness, rcasDenoise, lfga, tepd, bpp, paletteMatch, paletteDither, matchPaletteFrom);
     }
     return 0;
 }
