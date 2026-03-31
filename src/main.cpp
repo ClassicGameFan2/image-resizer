@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <algorithm>
 #include <cstring>
+#include <cmath>
+#include <iomanip>
 #include "stb_image.h"
 #include "stb_image_write.h"
 #include "dither.h"
@@ -18,38 +20,103 @@ extern void scaleBilinear(const unsigned char* input, int inW, int inH, unsigned
 extern void scaleBicubic(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH, float lfga, bool tepd);
 extern void scaleLanczos3(const unsigned char* input, int inW, int inH, unsigned char* output, int outW, int outH, float lfga, bool tepd);
 
+// --- NEW: PSNR CALCULATOR ---
+double calculatePSNR(const unsigned char* img1, const unsigned char* img2, int width, int height) {
+    double mse = 0.0;
+    for (int i = 0; i < width * height * 4; i += 4) {
+        // Evaluate only RGB for structural fidelity
+        double dr = (double)img1[i+0] - (double)img2[i+0];
+        double dg = (double)img1[i+1] - (double)img2[i+1];
+        double db = (double)img1[i+2] - (double)img2[i+2];
+        mse += dr*dr + dg*dg + db*db;
+    }
+    mse /= (width * height * 3.0);
+    if (mse <= 0.0000001) return 100.0; // Infinite / Perfect Match
+    return 10.0 * std::log10((255.0 * 255.0) / mse);
+}
+
+// --- NEW: THE AUTO-TUNER ---
+void optimizeRCAS(const unsigned char* originalImg, int width, int height, const std::string& upAlgo, 
+                  float downScale, const std::string& downAlgo, bool rcasDenoise, 
+                  bool& outUseRcas, float& outSharpness) {
+                  
+    std::cout << "  [Auto-Tuner] Running PSNR optimization pass (" << downScale << "x " << downAlgo << " downscale -> " << upAlgo << " upscale)..." << std::endl;
+
+    int downW = std::max(1, (int)(width * downScale));
+    int downH = std::max(1, (int)(height * downScale));
+    
+    unsigned char* downData = new unsigned char[downW * downH * 4];
+    unsigned char* upData = new unsigned char[width * height * 4];
+    
+    // 1. Downscale
+    if (downAlgo == "nearest") scaleNearestNeighbor(originalImg, width, height, downData, downW, downH);
+    else if (downAlgo == "bilinear") scaleBilinear(originalImg, width, height, downData, downW, downH, 0.0f, false);
+    else if (downAlgo == "lanczos3") scaleLanczos3(originalImg, width, height, downData, downW, downH, 0.0f, false);
+    else scaleBicubic(originalImg, width, height, downData, downW, downH, 0.0f, false); // Default Bicubic
+
+    // 2. Upscale back to original size
+    if (upAlgo == "nearest") scaleNearestNeighbor(downData, downW, downH, upData, width, height);
+    else if (upAlgo == "bilinear") scaleBilinear(downData, downW, downH, upData, width, height, 0.0f, false);
+    else if (upAlgo == "bicubic") scaleBicubic(downData, downW, downH, upData, width, height, 0.0f, false);
+    else if (upAlgo == "lanczos3") scaleLanczos3(downData, downW, downH, upData, width, height, 0.0f, false);
+    else if (upAlgo == "fsr") scaleFSR_EASU(downData, downW, downH, upData, width, height, 0.0f, false);
+
+    // 3. Evaluate Base (RCAS OFF)
+    double bestPsnr = calculatePSNR(originalImg, upData, width, height);
+    outUseRcas = false;
+    outSharpness = 0.0f;
+    
+    // 4. Evaluate RCAS (0.0 to 2.0)
+    unsigned char* rcasData = new unsigned char[width * height * 4];
+    for (int i = 0; i <= 20; ++i) {
+        float testSharpness = i / 10.0f;
+        applyFSR_RCAS(upData, width, height, rcasData, testSharpness, rcasDenoise, 0.0f, false);
+        double psnr = calculatePSNR(originalImg, rcasData, width, height);
+        
+        if (psnr > bestPsnr) {
+            bestPsnr = psnr;
+            outUseRcas = true;
+            outSharpness = testSharpness;
+        }
+    }
+
+    std::cout << "  [Auto-Tuner] Peak PSNR: " << std::fixed << std::setprecision(2) << bestPsnr << " dB -> ";
+    if (outUseRcas) std::cout << "Winning Setting: RCAS ON (Sharpness " << outSharpness << ")" << std::endl;
+    else std::cout << "Winning Setting: RCAS OFF" << std::endl;
+
+    delete[] downData;
+    delete[] upData;
+    delete[] rcasData;
+}
+
+
 bool processImage(const std::string& inFile, const std::string& outFile, float scale, const std::string& algo, 
                   bool useRcas, float sharpness, bool rcasDenoise, float lfga, bool tepd, int bpp,
-                  const std::string& paletteMatch, const std::string& paletteDither, const std::string& matchPaletteFrom) {
+                  const std::string& paletteMatch, const std::string& paletteDither, const std::string& matchPaletteFrom,
+                  bool runPsnrOpt, float psnrDownScale, const std::string& psnrDownAlgo) {
                   
-    // --- SMART PALETTE LOGIC ---
     std::vector<ColorRGBA> targetPalette;
     bool hasTransparency = false;
     bool shouldMatch = false;
 
     if (bpp == 8) {
         if (!matchPaletteFrom.empty()) {
-            // Priority 1: User specified an external file to rip the palette from
             if (!loadOriginalPalette(matchPaletteFrom, targetPalette, hasTransparency)) {
                 std::cout << "Error: Could not load palette from " << matchPaletteFrom << std::endl;
                 return false;
             }
             shouldMatch = true;
         } else {
-            // Check if input is 8-bit
             bool is8Bit = loadOriginalPalette(inFile, targetPalette, hasTransparency);
-            
             if (paletteMatch == "on") {
                 if (!is8Bit) {
-                    std::cout << "Error: --palette-match on requested, but input is not an 8-bit PNG." << std::endl;
+                    std::cout << "Error: --palette-match on requested, but input is not 8-bit." << std::endl;
                     return false;
                 }
                 shouldMatch = true;
             } else if (paletteMatch == "auto") {
-                // Priority 2: Auto mode. If input is 8-bit, keep the palette!
                 shouldMatch = is8Bit;
             } else {
-                // Priority 3: "off". We will generate a brand new palette later.
                 shouldMatch = false;
             }
         }
@@ -58,6 +125,11 @@ bool processImage(const std::string& inFile, const std::string& outFile, float s
     int width, height, channels;
     unsigned char* imgData = stbi_load(inFile.c_str(), &width, &height, &channels, 4);
     if (!imgData) return false;
+
+    // --- NEW: RUN AUTO-TUNER IF REQUESTED ---
+    if (runPsnrOpt && algo != "off") {
+        optimizeRCAS(imgData, width, height, algo, psnrDownScale, psnrDownAlgo, rcasDenoise, useRcas, sharpness);
+    }
 
     // --- SCALING ---
     int newW = width;
@@ -91,13 +163,11 @@ bool processImage(const std::string& inFile, const std::string& outFile, float s
         delete[] step1Data;
     }
 
-    // --- SAVING AND COLOR FORMATTING ---
+    // --- SAVING ---
     if (bpp == 8) {
-        // If we didn't inherit a palette, GENERATE a new optimal 256-color palette!
         if (!shouldMatch) {
             generatePalette(finalData, newW, newH, targetPalette, hasTransparency);
         }
-        
         unsigned char* indexedData = new unsigned char[newW * newH];
         bool useFS = (paletteDither == "fs");
         
@@ -130,12 +200,15 @@ int main(int argc, char** argv) {
     std::cout << "--- Image Resizer CPU ---" << std::endl;
 
     std::string inputPath = "", outputPath = "", suffix = "", algo = "fsr", rcasInput = "auto";
-    std::string paletteMatch = "auto";
-    std::string matchPaletteFrom = "";
-    std::string paletteDither = "none";
+    std::string paletteMatch = "auto", matchPaletteFrom = "", paletteDither = "none";
     float scale = 2.0f, sharpness = 0.2f, lfga = 0.0f;
     bool rcasDenoise = false, tepd = false;
     int bpp = 32;
+
+    // Auto-Tuner vars
+    bool runPsnrOpt = false;
+    float psnrDownScale = 0.5f;
+    std::string psnrDownAlgo = "bicubic";
 
     for(int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -151,6 +224,23 @@ int main(int argc, char** argv) {
         else if (arg == "--palette-match" && i + 1 < argc) paletteMatch = argv[++i];
         else if (arg == "--match-palette-from" && i + 1 < argc) matchPaletteFrom = argv[++i];
         else if (arg == "--palette-dither" && i + 1 < argc) paletteDither = argv[++i];
+        else if (arg == "--rcas-max-psnr") {
+            runPsnrOpt = true;
+            // Check if next arg is a parameter for this flag (e.g., 0.5,bicubic)
+            if (i + 1 < argc) {
+                std::string nextArg = argv[i+1];
+                if (nextArg.find("--") != 0) {
+                    size_t comma = nextArg.find(',');
+                    if (comma != std::string::npos) {
+                        try {
+                            psnrDownScale = std::stof(nextArg.substr(0, comma));
+                            psnrDownAlgo = nextArg.substr(comma + 1);
+                        } catch(...) {} // Ignore typos, fall back to defaults
+                    }
+                    i++; // Consume the argument
+                }
+            }
+        }
         else if (inputPath.empty()) inputPath = arg;
         else if (outputPath.empty()) outputPath = arg;
     }
@@ -161,6 +251,7 @@ int main(int argc, char** argv) {
         std::cout << "PostFx: --rcas on|off --sharpness 0.2 --rcas-denoise on|off --lfga 0.0 --tepd on|off" << std::endl;
         std::cout << "Output: --bpp 32|24|8 --suffix _hd" << std::endl;
         std::cout << "8-Bit: --palette-match auto|on|off --match-palette-from <file> --palette-dither fs|none" << std::endl;
+        std::cout << "Auto-Tune: --rcas-max-psnr [0.5,bicubic]" << std::endl;
         return 1;
     }
 
@@ -172,11 +263,11 @@ int main(int argc, char** argv) {
             if (entry.is_regular_file() && entry.path().extension().string() == ".png") {
                 std::string outFilePath = (fs::path(outputPath) / (entry.path().stem().string() + suffix + ".png")).string();
                 std::cout << " -> " << entry.path().filename().string() << std::endl;
-                processImage(entry.path().string(), outFilePath, scale, algo, useRcas, sharpness, rcasDenoise, lfga, tepd, bpp, paletteMatch, paletteDither, matchPaletteFrom);
+                processImage(entry.path().string(), outFilePath, scale, algo, useRcas, sharpness, rcasDenoise, lfga, tepd, bpp, paletteMatch, paletteDither, matchPaletteFrom, runPsnrOpt, psnrDownScale, psnrDownAlgo);
             }
         }
     } else {
-        processImage(inputPath, outputPath, scale, algo, useRcas, sharpness, rcasDenoise, lfga, tepd, bpp, paletteMatch, paletteDither, matchPaletteFrom);
+        processImage(inputPath, outputPath, scale, algo, useRcas, sharpness, rcasDenoise, lfga, tepd, bpp, paletteMatch, paletteDither, matchPaletteFrom, runPsnrOpt, psnrDownScale, psnrDownAlgo);
     }
     return 0;
 }
