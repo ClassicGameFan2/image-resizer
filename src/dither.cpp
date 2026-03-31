@@ -35,23 +35,22 @@ bool loadOriginalPalette(const std::string& filename, std::vector<ColorRGBA>& ou
     return true;
 }
 
-// NEW: 1.5 GENERATE OPTIMAL PALETTE (MEDIAN CUT ALGORITHM)
+// 1.5 GENERATE OPTIMAL PALETTE (MODIFIED MEDIAN CUT ALGORITHM)
 void generatePalette(const unsigned char* image, int width, int height, std::vector<ColorRGBA>& outPalette, bool& hasTransparency) {
     outPalette.clear();
     hasTransparency = false;
     std::vector<ColorRGBA> pixels;
     pixels.reserve(width * height);
 
-    // Filter out transparency
     for (int i = 0; i < width * height; ++i) {
         ColorRGBA c = { image[i*4], image[i*4+1], image[i*4+2], image[i*4+3] };
         if (c.a < 128) hasTransparency = true;
         else pixels.push_back(c);
     }
 
-    if (hasTransparency) outPalette.push_back({0, 0, 0, 0}); // Reserve Index 0
+    if (hasTransparency) outPalette.push_back({0, 0, 0, 0});
 
-    if (pixels.empty()) { // Edge case: completely invisible image
+    if (pixels.empty()) { 
         while(outPalette.size() < 256) outPalette.push_back({0,0,0,255});
         return;
     }
@@ -77,7 +76,6 @@ void generatePalette(const unsigned char* image, int width, int height, std::vec
 
     size_t targetColors = hasTransparency ? 255 : 256;
 
-    // Split buckets until we hit our target color count
     while (buckets.size() < targetColors) {
         int maxRange = -1;
         int maxIdx = -1;
@@ -97,24 +95,40 @@ void generatePalette(const unsigned char* image, int width, int height, std::vec
             }
         }
 
-        if (maxIdx == -1) break; // Cannot split anymore
+        if (maxIdx == -1) break;
 
         Bucket& b = buckets[maxIdx];
         if (splitAxis == 0) std::sort(b.colors.begin(), b.colors.end(), [](const ColorRGBA& c1, const ColorRGBA& c2){ return c1.r < c2.r; });
         else if (splitAxis == 1) std::sort(b.colors.begin(), b.colors.end(), [](const ColorRGBA& c1, const ColorRGBA& c2){ return c1.g < c2.g; });
         else std::sort(b.colors.begin(), b.colors.end(), [](const ColorRGBA& c1, const ColorRGBA& c2){ return c1.b < c2.b; });
 
-        size_t median = b.colors.size() / 2;
+        // CRITICAL FIX: Split at the actual Color Midpoint, not the pixel count median!
+        // This stops massive clusters of bright pixels from washing out dark colors.
+        int splitVal = 0;
+        if (splitAxis == 0) splitVal = b.rMin + (b.rMax - b.rMin) / 2;
+        else if (splitAxis == 1) splitVal = b.gMin + (b.gMax - b.gMin) / 2;
+        else splitVal = b.bMin + (b.bMax - b.bMin) / 2;
+
+        auto splitIt = b.colors.begin() + b.colors.size() / 2; // Fallback
+        for (auto it = b.colors.begin(); it != b.colors.end(); ++it) {
+            int val = (splitAxis == 0) ? it->r : ((splitAxis == 1) ? it->g : it->b);
+            if (val >= splitVal) {
+                if (it != b.colors.begin() && it != b.colors.end()) {
+                    splitIt = it;
+                }
+                break;
+            }
+        }
+
         Bucket b1, b2;
-        b1.colors.assign(b.colors.begin(), b.colors.begin() + median);
-        b2.colors.assign(b.colors.begin() + median, b.colors.end());
+        b1.colors.assign(b.colors.begin(), splitIt);
+        b2.colors.assign(splitIt, b.colors.end());
 
         b1.updateBounds(); b2.updateBounds();
         buckets[maxIdx] = b1;
         buckets.push_back(b2);
     }
 
-    // Average the colors in each bucket to generate the final palette
     for (const auto& b : buckets) {
         if (b.colors.empty()) continue;
         long long rSum = 0, gSum = 0, bSum = 0;
@@ -129,18 +143,22 @@ void generatePalette(const unsigned char* image, int width, int height, std::vec
     while (outPalette.size() < 256) outPalette.push_back({0, 0, 0, 255});
 }
 
-// 2. FIND NEAREST SOLID COLOR
+// 2. FIND NEAREST SOLID COLOR (PERCEPTUAL LUMA WEIGHTED)
 int findNearestSolid(int r, int g, int b, const std::vector<ColorRGBA>& palette) {
     int bestIdx = 0;
-    int bestDist = 255 * 255 * 3 + 1;
+    long long bestDist = 255LL * 255LL * 1000LL + 1LL; 
     
     for (size_t i = 0; i < palette.size(); ++i) {
         if (palette[i].a < 128) continue; 
         
-        int dr = r - palette[i].r;
-        int dg = g - palette[i].g;
-        int db = b - palette[i].b;
-        int dist = dr*dr + dg*dg + db*db;
+        long long dr = r - palette[i].r;
+        long long dg = g - palette[i].g;
+        long long db = b - palette[i].b;
+        
+        // CRITICAL FIX: Human Perceptual Distance Weighting (R=299, G=587, B=114)
+        // This stops dark reds from mathematically snapping to dark blues/greens!
+        long long dist = (dr * dr * 299) + (dg * dg * 587) + (db * db * 114);
+        
         if (dist < bestDist) {
             bestDist = dist;
             bestIdx = (int)i;
@@ -154,6 +172,7 @@ void quantizeAndDither(const unsigned char* input, int width, int height, unsign
                        const std::vector<ColorRGBA>& palette, bool hasTransparency, bool useFloydSteinberg) {
     
     std::vector<float> errBuf(width * height * 3, 0.0f);
+    
     int transpIdx = -1;
     if (hasTransparency) {
         for (size_t i = 0; i < palette.size(); ++i) {
@@ -221,7 +240,11 @@ bool saveIndexedPNG(const char* filename, const unsigned char* indexedData, int 
     
     std::vector<unsigned char> buffer;
     unsigned error = lodepng::encode(buffer, indexedData, width, height, state);
-    if (error) return false;
+    if (error) {
+        std::cout << "LodePNG encode error: " << lodepng_error_text(error) << std::endl;
+        return false;
+    }
+    
     error = lodepng::save_file(buffer, filename);
     return error == 0;
 }
