@@ -35,7 +35,30 @@ bool loadOriginalPalette(const std::string& filename, std::vector<ColorRGBA>& ou
     return true;
 }
 
-// 1.5 GENERATE OPTIMAL PALETTE (MODIFIED MEDIAN CUT ALGORITHM)
+// 2. FIND NEAREST SOLID COLOR (PERCEPTUAL LUMA WEIGHTED)
+int findNearestSolid(int r, int g, int b, const std::vector<ColorRGBA>& palette) {
+    int bestIdx = 0;
+    long long bestDist = 255LL * 255LL * 1000LL + 1LL; 
+    
+    for (size_t i = 0; i < palette.size(); ++i) {
+        if (palette[i].a < 128) continue; 
+        
+        long long dr = r - palette[i].r;
+        long long dg = g - palette[i].g;
+        long long db = b - palette[i].b;
+        
+        // Human Perceptual Distance Weighting
+        long long dist = (dr * dr * 299) + (dg * dg * 587) + (db * db * 114);
+        
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestIdx = (int)i;
+        }
+    }
+    return bestIdx;
+}
+
+// 3. GENERATE OPTIMAL PALETTE (SPATIAL MEDIAN CUT + K-MEANS CLUSTERING)
 void generatePalette(const unsigned char* image, int width, int height, std::vector<ColorRGBA>& outPalette, bool& hasTransparency) {
     outPalette.clear();
     hasTransparency = false;
@@ -55,6 +78,13 @@ void generatePalette(const unsigned char* image, int width, int height, std::vec
         return;
     }
 
+    // Sub-sample to a maximum of ~100k pixels to make K-Means training blazingly fast
+    std::vector<ColorRGBA> samplePixels;
+    int step = std::max(1, (int)(pixels.size() / 100000));
+    for (size_t i = 0; i < pixels.size(); i += step) {
+        samplePixels.push_back(pixels[i]);
+    }
+
     struct Bucket {
         std::vector<ColorRGBA> colors;
         int rMin=255, rMax=0, gMin=255, gMax=0, bMin=255, bMax=0;
@@ -70,12 +100,13 @@ void generatePalette(const unsigned char* image, int width, int height, std::vec
 
     std::vector<Bucket> buckets;
     Bucket initial;
-    initial.colors = pixels;
+    initial.colors = samplePixels;
     initial.updateBounds();
     buckets.push_back(initial);
 
     size_t targetColors = hasTransparency ? 255 : 256;
 
+    // STEP A: Spatial Median Cut (Ensures rare colors like the Red Barn are preserved)
     while (buckets.size() < targetColors) {
         int maxRange = -1;
         int maxIdx = -1;
@@ -102,20 +133,16 @@ void generatePalette(const unsigned char* image, int width, int height, std::vec
         else if (splitAxis == 1) std::sort(b.colors.begin(), b.colors.end(), [](const ColorRGBA& c1, const ColorRGBA& c2){ return c1.g < c2.g; });
         else std::sort(b.colors.begin(), b.colors.end(), [](const ColorRGBA& c1, const ColorRGBA& c2){ return c1.b < c2.b; });
 
-        // CRITICAL FIX: Split at the actual Color Midpoint, not the pixel count median!
-        // This stops massive clusters of bright pixels from washing out dark colors.
         int splitVal = 0;
         if (splitAxis == 0) splitVal = b.rMin + (b.rMax - b.rMin) / 2;
         else if (splitAxis == 1) splitVal = b.gMin + (b.gMax - b.gMin) / 2;
         else splitVal = b.bMin + (b.bMax - b.bMin) / 2;
 
-        auto splitIt = b.colors.begin() + b.colors.size() / 2; // Fallback
+        auto splitIt = b.colors.begin() + b.colors.size() / 2;
         for (auto it = b.colors.begin(); it != b.colors.end(); ++it) {
             int val = (splitAxis == 0) ? it->r : ((splitAxis == 1) ? it->g : it->b);
             if (val >= splitVal) {
-                if (it != b.colors.begin() && it != b.colors.end()) {
-                    splitIt = it;
-                }
+                if (it != b.colors.begin() && it != b.colors.end()) splitIt = it;
                 break;
             }
         }
@@ -141,33 +168,29 @@ void generatePalette(const unsigned char* image, int width, int height, std::vec
     }
 
     while (outPalette.size() < 256) outPalette.push_back({0, 0, 0, 255});
-}
 
-// 2. FIND NEAREST SOLID COLOR (PERCEPTUAL LUMA WEIGHTED)
-int findNearestSolid(int r, int g, int b, const std::vector<ColorRGBA>& palette) {
-    int bestIdx = 0;
-    long long bestDist = 255LL * 255LL * 1000LL + 1LL; 
-    
-    for (size_t i = 0; i < palette.size(); ++i) {
-        if (palette[i].a < 128) continue; 
+    // STEP B: K-MEANS REFINEMENT (Pulls the colors directly onto the rich blacks/browns)
+    int startIdx = hasTransparency ? 1 : 0;
+    for (int iter = 0; iter < 5; ++iter) {
+        std::vector<long long> rSum(256, 0), gSum(256, 0), bSum(256, 0), counts(256, 0);
         
-        long long dr = r - palette[i].r;
-        long long dg = g - palette[i].g;
-        long long db = b - palette[i].b;
+        for (const auto& c : samplePixels) {
+            int idx = findNearestSolid(c.r, c.g, c.b, outPalette);
+            rSum[idx] += c.r; gSum[idx] += c.g; bSum[idx] += c.b;
+            counts[idx]++;
+        }
         
-        // CRITICAL FIX: Human Perceptual Distance Weighting (R=299, G=587, B=114)
-        // This stops dark reds from mathematically snapping to dark blues/greens!
-        long long dist = (dr * dr * 299) + (dg * dg * 587) + (db * db * 114);
-        
-        if (dist < bestDist) {
-            bestDist = dist;
-            bestIdx = (int)i;
+        for (int i = startIdx; i < 256; ++i) {
+            if (counts[i] > 0) {
+                outPalette[i].r = (unsigned char)(rSum[i] / counts[i]);
+                outPalette[i].g = (unsigned char)(gSum[i] / counts[i]);
+                outPalette[i].b = (unsigned char)(bSum[i] / counts[i]);
+            }
         }
     }
-    return bestIdx;
 }
 
-// 3. THE FLOYD-STEINBERG DITHERING ENGINE
+// 4. THE FLOYD-STEINBERG DITHERING ENGINE
 void quantizeAndDither(const unsigned char* input, int width, int height, unsigned char* output, 
                        const std::vector<ColorRGBA>& palette, bool hasTransparency, bool useFloydSteinberg) {
     
@@ -224,7 +247,7 @@ void quantizeAndDither(const unsigned char* input, int width, int height, unsign
     }
 }
 
-// 4. SAVE USING LODEPNG
+// 5. SAVE USING LODEPNG
 bool saveIndexedPNG(const char* filename, const unsigned char* indexedData, int width, int height, const std::vector<ColorRGBA>& palette) {
     lodepng::State state;
     state.encoder.auto_convert = 0; 
