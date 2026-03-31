@@ -11,6 +11,9 @@ struct ColorRGBA {
 
 bool loadOriginalPalette(const std::string& filename, std::vector<ColorRGBA>& outPalette, bool& hasTransparency);
 
+// NEW: Generates an optimal 256-color palette from a 32-bit image!
+void generatePalette(const unsigned char* image, int width, int height, std::vector<ColorRGBA>& outPalette, bool& hasTransparency);
+
 void quantizeAndDither(const unsigned char* input, int width, int height, unsigned char* output, 
                        const std::vector<ColorRGBA>& palette, bool hasTransparency, bool useFloydSteinberg);
 
