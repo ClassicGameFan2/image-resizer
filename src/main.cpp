@@ -6,7 +6,7 @@
 #include <cstring>
 #include "stb_image.h"
 #include "stb_image_write.h"
-#include "dither.h" // Our new engine!
+#include "dither.h"
 
 namespace fs = std::filesystem;
 
@@ -22,19 +22,20 @@ bool processImage(const std::string& inFile, const std::string& outFile, float s
                   bool useRcas, float sharpness, bool rcasDenoise, float lfga, bool tepd, int bpp,
                   bool paletteMatch, const std::string& paletteDither) {
                   
+    // --- PHASE 4: EXACT PALETTE EXTRACTION ---
+    std::vector<ColorRGBA> originalPalette;
+    bool hasTransparency = false;
+    
+    if (bpp == 8 && paletteMatch) {
+        if (!loadOriginalPalette(inFile, originalPalette, hasTransparency)) {
+            std::cout << "Error: Input image is NOT an 8-bit indexed PNG! Cannot palette-match." << std::endl;
+            return false;
+        }
+    }
+
     int width, height, channels;
     unsigned char* imgData = stbi_load(inFile.c_str(), &width, &height, &channels, 4);
     if (!imgData) return false;
-
-    // --- PHASE 4: PALETTE EXTRACTION ---
-    std::vector<ColorRGBA> originalPalette;
-    bool hasTransparency = false;
-    if (bpp == 8 && paletteMatch) {
-        extractPalette(imgData, width, height, originalPalette, hasTransparency);
-        if (originalPalette.size() > 256) {
-            std::cout << "Warning: Input image has more than 256 colors! Palette match will drop extra colors." << std::endl;
-        }
-    }
 
     // --- SCALING ---
     int newW = width;
@@ -84,7 +85,6 @@ bool processImage(const std::string& inFile, const std::string& outFile, float s
         delete[] indexedData;
     } 
     else {
-        // Standard 24/32-bit saving via stb_image
         int outChannels = 4;
         unsigned char* saveBuffer = finalData;
         
