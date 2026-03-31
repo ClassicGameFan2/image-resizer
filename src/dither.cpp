@@ -10,11 +10,17 @@ bool loadOriginalPalette(const std::string& filename, std::vector<ColorRGBA>& ou
     lodepng::load_file(buffer, filename);
     
     lodepng::State state;
+    // CRITICAL FIX: Tell the decoder NOT to convert the color format to 32-bit so we can read the raw palette!
+    state.decoder.color_convert = 0; 
+    
+    std::vector<unsigned char> dummyPixels;
     unsigned w, h;
-    unsigned error = lodepng_inspect(&w, &h, &state, buffer.data(), buffer.size());
-    if (error) return false;
+    unsigned error = lodepng::decode(dummyPixels, w, h, state, buffer);
+    if (error) {
+        std::cout << "LodePNG decode error: " << lodepng_error_text(error) << std::endl;
+        return false;
+    }
 
-    // Ensure the input image actually has a palette!
     if (state.info_png.color.colortype != LCT_PALETTE) {
         return false;
     }
@@ -23,6 +29,7 @@ bool loadOriginalPalette(const std::string& filename, std::vector<ColorRGBA>& ou
     hasTransparency = false;
     size_t palSize = state.info_png.color.palettesize;
     
+    // Rip the exact original palette
     for (size_t i = 0; i < palSize; ++i) {
         ColorRGBA c;
         c.r = state.info_png.color.palette[i * 4 + 0];
@@ -33,7 +40,7 @@ bool loadOriginalPalette(const std::string& filename, std::vector<ColorRGBA>& ou
         if (c.a < 128) hasTransparency = true;
     }
     
-    // Pad the palette to exactly 256 colors. Retro engines crash if it's less than 256!
+    // Pad to exactly 256 colors to prevent retro engine crashes
     while (outPalette.size() < 256) {
         outPalette.push_back({0, 0, 0, 255});
     }
@@ -47,7 +54,6 @@ int findNearestSolid(int r, int g, int b, const std::vector<ColorRGBA>& palette)
     int bestDist = 255 * 255 * 3 + 1;
     
     for (size_t i = 0; i < palette.size(); ++i) {
-        // Skip transparent indices so we don't accidentally snap solid colors to invisibility
         if (palette[i].a < 128) continue; 
         
         int dr = r - palette[i].r;
@@ -68,7 +74,6 @@ void quantizeAndDither(const unsigned char* input, int width, int height, unsign
     
     std::vector<float> errBuf(width * height * 3, 0.0f);
     
-    // Find exactly where the transparent color lives in the original palette
     int transpIdx = -1;
     if (hasTransparency) {
         for (size_t i = 0; i < palette.size(); ++i) {
@@ -81,10 +86,9 @@ void quantizeAndDither(const unsigned char* input, int width, int height, unsign
             int idx = (y * width + x);
             int pIdx = idx * 4;
             
-            // If the pixel is transparent, snap it to the exact original transparency index!
             if (hasTransparency && input[pIdx+3] < 128 && transpIdx != -1) {
                 output[idx] = (unsigned char)transpIdx; 
-                continue; // Do not diffuse error for transparent pixels
+                continue; 
             }
             
             float r = input[pIdx+0] + errBuf[idx*3+0];
@@ -125,6 +129,9 @@ void quantizeAndDither(const unsigned char* input, int width, int height, unsign
 bool saveIndexedPNG(const char* filename, const unsigned char* indexedData, int width, int height, const std::vector<ColorRGBA>& palette) {
     lodepng::State state;
     
+    // CRITICAL FIX: Force LodePNG to save exactly as 8-bit, do not auto-compress to 1-bit!
+    state.encoder.auto_convert = 0; 
+    
     state.info_png.color.colortype = LCT_PALETTE;
     state.info_png.color.bitdepth = 8;
     state.info_raw.colortype = LCT_PALETTE;
@@ -137,7 +144,10 @@ bool saveIndexedPNG(const char* filename, const unsigned char* indexedData, int 
     
     std::vector<unsigned char> buffer;
     unsigned error = lodepng::encode(buffer, indexedData, width, height, state);
-    if (error) return false;
+    if (error) {
+        std::cout << "LodePNG encode error: " << lodepng_error_text(error) << std::endl;
+        return false;
+    }
     
     error = lodepng::save_file(buffer, filename);
     return error == 0;
