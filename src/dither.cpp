@@ -4,45 +4,56 @@
 #include <algorithm>
 #include <iostream>
 
-// 1. EXTRACT PALETTE & AUTO-DETECT TRANSPARENCY
-bool extractPalette(const unsigned char* input, int width, int height, std::vector<ColorRGBA>& outPalette, bool& hasTransparency) {
+// 1. EXTRACT EXACT ORIGINAL PALETTE USING LODEPNG
+bool loadOriginalPalette(const std::string& filename, std::vector<ColorRGBA>& outPalette, bool& hasTransparency) {
+    std::vector<unsigned char> buffer;
+    lodepng::load_file(buffer, filename);
+    
+    lodepng::State state;
+    unsigned w, h;
+    unsigned error = lodepng_inspect(&w, &h, &state, buffer.data(), buffer.size());
+    if (error) return false;
+
+    // Ensure the input image actually has a palette!
+    if (state.info_png.color.colortype != LCT_PALETTE) {
+        return false;
+    }
+
     outPalette.clear();
     hasTransparency = false;
-
-    for (int i = 0; i < width * height; ++i) {
-        ColorRGBA c = { input[i*4], input[i*4+1], input[i*4+2], input[i*4+3] };
-        
-        if (c.a < 128) {
-            if (!hasTransparency) {
-                hasTransparency = true;
-                // Force the transparent color to be at Index 0
-                outPalette.insert(outPalette.begin(), c); 
-            }
-        } else {
-            bool found = false;
-            for (const auto& pc : outPalette) {
-                if (pc == c) { found = true; break; }
-            }
-            if (!found) {
-                if (outPalette.size() < 256) {
-                    outPalette.push_back(c);
-                }
-            }
-        }
+    size_t palSize = state.info_png.color.palettesize;
+    
+    for (size_t i = 0; i < palSize; ++i) {
+        ColorRGBA c;
+        c.r = state.info_png.color.palette[i * 4 + 0];
+        c.g = state.info_png.color.palette[i * 4 + 1];
+        c.b = state.info_png.color.palette[i * 4 + 2];
+        c.a = state.info_png.color.palette[i * 4 + 3];
+        outPalette.push_back(c);
+        if (c.a < 128) hasTransparency = true;
     }
+    
+    // Pad the palette to exactly 256 colors. Retro engines crash if it's less than 256!
+    while (outPalette.size() < 256) {
+        outPalette.push_back({0, 0, 0, 255});
+    }
+
     return true;
 }
 
-// 2. FIND NEAREST COLOR IN 3D RGB SPACE
-int findNearest(int r, int g, int b, const std::vector<ColorRGBA>& palette, int startIdx) {
-    int bestIdx = startIdx;
+// 2. FIND NEAREST SOLID COLOR
+int findNearestSolid(int r, int g, int b, const std::vector<ColorRGBA>& palette) {
+    int bestIdx = 0;
     int bestDist = 255 * 255 * 3 + 1;
     
-    for (size_t i = startIdx; i < palette.size(); ++i) {
+    for (size_t i = 0; i < palette.size(); ++i) {
+        // Skip transparent indices so we don't accidentally snap solid colors to invisibility
+        if (palette[i].a < 128) continue; 
+        
         int dr = r - palette[i].r;
         int dg = g - palette[i].g;
         int db = b - palette[i].b;
-        int dist = dr*dr + dg*dg + db*db; // Euclidean distance
+        int dist = dr*dr + dg*dg + db*db;
         if (dist < bestDist) {
             bestDist = dist;
             bestIdx = (int)i;
@@ -55,21 +66,27 @@ int findNearest(int r, int g, int b, const std::vector<ColorRGBA>& palette, int 
 void quantizeAndDither(const unsigned char* input, int width, int height, unsigned char* output, 
                        const std::vector<ColorRGBA>& palette, bool hasTransparency, bool useFloydSteinberg) {
     
-    // We use a float buffer to carry the mathematical "error" to neighboring pixels
     std::vector<float> errBuf(width * height * 3, 0.0f);
+    
+    // Find exactly where the transparent color lives in the original palette
+    int transpIdx = -1;
+    if (hasTransparency) {
+        for (size_t i = 0; i < palette.size(); ++i) {
+            if (palette[i].a < 128) { transpIdx = (int)i; break; }
+        }
+    }
     
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             int idx = (y * width + x);
             int pIdx = idx * 4;
             
-            // If the pixel is transparent, snap to Index 0 and skip dithering!
-            if (hasTransparency && input[pIdx+3] < 128) {
-                output[idx] = 0; 
-                continue;
+            // If the pixel is transparent, snap it to the exact original transparency index!
+            if (hasTransparency && input[pIdx+3] < 128 && transpIdx != -1) {
+                output[idx] = (unsigned char)transpIdx; 
+                continue; // Do not diffuse error for transparent pixels
             }
             
-            // Add any error pushed to this pixel from previous pixels
             float r = input[pIdx+0] + errBuf[idx*3+0];
             float g = input[pIdx+1] + errBuf[idx*3+1];
             float b = input[pIdx+2] + errBuf[idx*3+2];
@@ -78,12 +95,9 @@ void quantizeAndDither(const unsigned char* input, int width, int height, unsign
             g = std::max(0.0f, std::min(255.0f, g));
             b = std::max(0.0f, std::min(255.0f, b));
             
-            // Skip index 0 if it is reserved for transparency
-            int startIdx = hasTransparency ? 1 : 0; 
-            int palIdx = findNearest((int)r, (int)g, (int)b, palette, startIdx);
+            int palIdx = findNearestSolid((int)r, (int)g, (int)b, palette);
             output[idx] = (unsigned char)palIdx;
             
-            // Calculate the error and diffuse it
             if (useFloydSteinberg) {
                 float er = r - palette[palIdx].r;
                 float eg = g - palette[palIdx].g;
@@ -111,7 +125,6 @@ void quantizeAndDither(const unsigned char* input, int width, int height, unsign
 bool saveIndexedPNG(const char* filename, const unsigned char* indexedData, int width, int height, const std::vector<ColorRGBA>& palette) {
     lodepng::State state;
     
-    // Tell LodePNG we want an 8-bit palette
     state.info_png.color.colortype = LCT_PALETTE;
     state.info_png.color.bitdepth = 8;
     state.info_raw.colortype = LCT_PALETTE;
@@ -119,7 +132,7 @@ bool saveIndexedPNG(const char* filename, const unsigned char* indexedData, int 
     
     for (const auto& c : palette) {
         lodepng_palette_add(&state.info_png.color, c.r, c.g, c.b, c.a);
-        lodepng_palette_add(&state.info_raw, c.r, c.g, c.b, c.a); // <-- FIXED TYPO HERE!
+        lodepng_palette_add(&state.info_raw, c.r, c.g, c.b, c.a);
     }
     
     std::vector<unsigned char> buffer;
