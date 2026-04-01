@@ -70,7 +70,8 @@ void optimizeRCAS(const unsigned char* originalImg, int width, int height, const
     unsigned char* rcasData = new unsigned char[width * height * 4];
     for (int i = 0; i <= 20; ++i) {
         float testSharpness = i / 10.0f;
-        applyFSR_RCAS(upData, width, height, rcasData, testSharpness, rcasDenoise, 0.0f, false);
+        // CRITICAL FIX: Hardcode Denoise (and LFGA/TEPD) to FALSE for a sterile PSNR environment!
+        applyFSR_RCAS(upData, width, height, rcasData, testSharpness, false, 0.0f, false);
         double psnr = calculatePSNR(originalImg, rcasData, width, height);
         
         if (psnr > bestPsnr) {
