@@ -2,7 +2,7 @@ name: Build C++ Application
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "changes1" ]
 
 jobs:
   build-windows:
