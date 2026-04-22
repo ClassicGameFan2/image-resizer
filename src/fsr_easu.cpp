@@ -1,5 +1,7 @@
 // Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
 // MIT License
+// Updated to FSR 1.2.2 (FidelityFX SDK v2.2.0)
+// EASU algorithm is unchanged between 1.0.2 and 1.2.2.
 
 #include "fsr_math.h"
 #include <cmath>
@@ -19,8 +21,10 @@ float sampleAlpha(const unsigned char* data, int w, int h, int x, int y) {
     return data[idx+3] / 255.0f;
 }
 
+// AMD luma approximation: luma*2 = B*0.5 + (R*0.5 + G)
+// Matches FSR 1.2.2 exactly: bczzL = bczzB*0.5 + (bczzR*0.5 + bczzG)
 float getLuma(float3 c) {
-    return c.x * 0.5f + c.y * 1.0f + c.z * 0.5f;
+    return c.z * 0.5f + (c.x * 0.5f + c.y);
 }
 
 void FsrEasuSetF(float2& dir, float& len, float2 pp, bool biS, bool biT, bool biU, bool biV, 
@@ -52,7 +56,6 @@ void FsrEasuSetF(float2& dir, float& len, float2 pp, bool biS, bool biT, bool bi
     len += lenY * w;
 }
 
-// UPDATE: Now takes aA (Accumulated Alpha) and alpha (Tap Alpha)
 void FsrEasuTapF(float3& aC, float& aA, float& aW, float2 off, float2 dir, float2 len2, float lob, float clp, float3 c, float alpha) {
     float2 v;
     v.x = (off.x * dir.x) + (off.y * dir.y);
@@ -71,7 +74,7 @@ void FsrEasuTapF(float3& aC, float& aA, float& aW, float2 off, float2 dir, float
     
     float w = wB * wA;
     aC = aC + c * w;
-    aA += alpha * w; // Accumulate the Alpha!
+    aA += alpha * w;
     aW += w;
 }
 
@@ -81,7 +84,6 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
     for (int y = 0; y < outH; ++y) {
         for (int x = 0; x < outW; ++x) {
             
-            // ... (Keep the exact same math here as before) ...
             float srcX = ((x + 0.5f) * inW) / outW - 0.5f;
             float srcY = ((y + 0.5f) * inH) / outH - 0.5f;
             int ix = (int)std::floor(srcX);
@@ -101,6 +103,7 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
             float3 n = sampleRGB(input, inW, inH, ix,   iy+2); float nA = sampleAlpha(input, inW, inH, ix,   iy+2);
             float3 o = sampleRGB(input, inW, inH, ix+1, iy+2); float oA = sampleAlpha(input, inW, inH, ix+1, iy+2);
 
+            // Luma: B*0.5 + (R*0.5 + G) — matches FSR 1.2.2 exactly
             float bL = getLuma(b); float cL = getLuma(c);
             float eL = getLuma(e); float fL = getLuma(f); float gL = getLuma(g); float hL = getLuma(h);
             float iL = getLuma(i); float jL = getLuma(j); float kL = getLuma(k); float lL = getLuma(l);
@@ -108,10 +111,10 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
 
             float2 dir(0.0f);
             float len = 0.0f;
-            FsrEasuSetF(dir, len, pp, true, false, false, false, bL, eL, fL, gL, jL);
-            FsrEasuSetF(dir, len, pp, false, true, false, false, cL, fL, gL, hL, kL);
-            FsrEasuSetF(dir, len, pp, false, false, true, false, fL, iL, jL, kL, nL);
-            FsrEasuSetF(dir, len, pp, false, false, false, true, gL, jL, kL, lL, oL);
+            FsrEasuSetF(dir, len, pp, true,  false, false, false, bL, eL, fL, gL, jL);
+            FsrEasuSetF(dir, len, pp, false, true,  false, false, cL, fL, gL, hL, kL);
+            FsrEasuSetF(dir, len, pp, false, false, true,  false, fL, iL, jL, kL, nL);
+            FsrEasuSetF(dir, len, pp, false, false, false, true,  gL, jL, kL, lL, oL);
 
             float dirR = dir.x * dir.x + dir.y * dir.y;
             bool zro = dirR < (1.0f / 32768.0f);
@@ -151,9 +154,10 @@ void scaleFSR_EASU(const unsigned char* input, int inW, int inH,
 
             float rcpWeight = 1.0f / std::max(aW, 1e-6f);
             float3 finalColor = aC * rcpWeight;
+            // Normalize and dering: clamp to neighborhood min/max
             finalColor = clamp(finalColor, min4, max4);
             
-            // APPLY POST-PROCESSING
+            // Apply post-processing
             finalColor = applyPostProcess(finalColor, x, y, lfga, useTepd);
 
             float finalAlpha = aA * rcpWeight;
