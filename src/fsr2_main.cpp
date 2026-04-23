@@ -2,12 +2,23 @@
 // fsr2_main.cpp
 // FSR 2.3.4 CPU Port — Static image upscaling entry point
 //
-// This is the top-level function called from main.cpp when --algo fsr2 is used.
-// It handles:
-//   1. Downscaling the input image to render resolution (the "render" step)
-//   2. Generating synthetic jitter frames using the Halton(2,3) sequence
-//   3. Running all FSR2 passes for each jitter frame
-//   4. Returning the final upscaled output
+// DATA FLOW CLARIFICATION:
+//   The input PNG is the "render resolution" image — FSR2 treats it as if
+//   a game engine rendered at this resolution. We do NOT downscale it.
+//   FSR2 upscales from (inW x inH) to (outW x outH) using temporal
+//   accumulation of synthetic sub-pixel jitter frames.
+//
+//   Frame generation:
+//     1. Start with the full input PNG at render resolution (inW x inH).
+//     2. For each jitter frame, shift the image by a sub-pixel Halton offset.
+//        (When jitter is OFF, all frames receive the unshifted image.)
+//     3. Run all FSR2 passes on each shifted frame.
+//     4. After N frames, the accumulated result is the upscaled output.
+//
+//   Why multiple frames?
+//     Each jitter frame samples a slightly different sub-pixel position.
+//     FSR2's accumulate pass combines them all, effectively reconstructing
+//     more detail than any single frame contains. This is temporal super-sampling.
 // =============================================================================
 #include "fsr2_context.h"
 #include "fsr2_jitter.h"
@@ -20,86 +31,71 @@
 #include <iostream>
 #include <algorithm>
 
-// ── uint8 ↔ float conversion helpers ────────────────────────────────────────
-static void uint8ToFloat(const unsigned char* src, float* dst, int count) {
-    for (int i = 0; i < count * 4; i++)
+// ── uint8 ↔ float ────────────────────────────────────────────────────────────
+static void uint8ToFloat(const unsigned char* src, float* dst, int pixelCount) {
+    for (int i = 0; i < pixelCount * 4; i++)
         dst[i] = src[i] / 255.0f;
 }
-static void floatToUint8(const float* src, unsigned char* dst, int count) {
-    for (int i = 0; i < count * 4; i++)
+static void floatToUint8(const float* src, unsigned char* dst, int pixelCount) {
+    for (int i = 0; i < pixelCount * 4; i++)
         dst[i] = (unsigned char)(clamp(src[i], 0.0f, 1.0f) * 255.0f + 0.5f);
 }
 
-// ── Bicubic downscale (float RGBA) ───────────────────────────────────────────
-// Uses the same Catmull-Rom kernel as scalers.cpp
+// ── Bicubic downscale for float RGBA ─────────────────────────────────────────
+// Used only when the user requests a render-res smaller than the input
+// (not the normal case — normally renderW == inW).
 static float cubicWF(float t) {
     t = std::abs(t);
-    if (t < 1.0f) return 1.5f*t*t*t - 2.5f*t*t + 1.0f;
+    if (t < 1.0f) return  1.5f*t*t*t - 2.5f*t*t + 1.0f;
     if (t < 2.0f) return -0.5f*t*t*t + 2.5f*t*t - 4.0f*t + 2.0f;
     return 0.0f;
 }
 
-static void bicubicDownscaleF(const float* src, int srcW, int srcH,
-                               float* dst, int dstW, int dstH) {
-    float scaleX = (float)srcW / (float)dstW;
-    float scaleY = (float)srcH / (float)dstH;
-    float filterScaleX = std::min(1.0f, (float)dstW / (float)srcW);
-    float filterScaleY = std::min(1.0f, (float)dstH / (float)srcH);
-    float radiusX = 2.0f / filterScaleX;
-    float radiusY = 2.0f / filterScaleY;
+static void bicubicResampleF(const float* src, int srcW, int srcH,
+                              float* dst, int dstW, int dstH)
+{
+    float scX = (float)srcW / (float)dstW;
+    float scY = (float)srcH / (float)dstH;
+    float fscX = std::min(1.0f, (float)dstW / (float)srcW);
+    float fscY = std::min(1.0f, (float)dstH / (float)srcH);
+    float radX = 2.0f / fscX, radY = 2.0f / fscY;
 
     for (int dy = 0; dy < dstH; dy++) {
-        float srcY = ((float)dy + 0.5f) / scaleY - 0.5f;
-        int yMin = std::max(0, (int)std::floor(srcY - radiusY + 1));
-        int yMax = std::min(srcH - 1, (int)std::floor(srcY + radiusY));
-
+        float sY = ((float)dy + 0.5f) / scY - 0.5f;
+        int y0 = std::max(0, (int)std::floor(sY - radY + 1));
+        int y1 = std::min(srcH - 1, (int)std::floor(sY + radY));
         for (int dx = 0; dx < dstW; dx++) {
-            float srcX = ((float)dx + 0.5f) / scaleX - 0.5f;
-            int xMin = std::max(0, (int)std::floor(srcX - radiusX + 1));
-            int xMax = std::min(srcW - 1, (int)std::floor(srcX + radiusX));
-
-            double r=0,g=0,b=0,a=0,wSum=0;
-            for (int cy = yMin; cy <= yMax; cy++) {
-                float wy = cubicWF((srcY - cy) * filterScaleY);
-                for (int cx = xMin; cx <= xMax; cx++) {
-                    float w = cubicWF((srcX - cx) * filterScaleX) * wy;
-                    size_t sIdx = ((size_t)cy * srcW + cx) * 4;
-                    r += src[sIdx+0] * w;
-                    g += src[sIdx+1] * w;
-                    b += src[sIdx+2] * w;
-                    a += src[sIdx+3] * w;
-                    wSum += w;
+            float sX = ((float)dx + 0.5f) / scX - 0.5f;
+            int x0 = std::max(0, (int)std::floor(sX - radX + 1));
+            int x1 = std::min(srcW - 1, (int)std::floor(sX + radX));
+            double r=0,g=0,b=0,a=0,ws=0;
+            for (int cy = y0; cy <= y1; cy++) {
+                float wy = cubicWF((sY - cy) * fscY);
+                for (int cx = x0; cx <= x1; cx++) {
+                    float w = cubicWF((sX - cx) * fscX) * wy;
+                    size_t i = ((size_t)cy * srcW + cx) * 4;
+                    r += src[i+0]*w; g += src[i+1]*w;
+                    b += src[i+2]*w; a += src[i+3]*w;
+                    ws += w;
                 }
             }
-            if (wSum < 1e-6f) wSum = 1.0f;
-            size_t dIdx = ((size_t)dy * dstW + dx) * 4;
-            dst[dIdx+0] = clamp((float)(r/wSum), 0.0f, 1.0f);
-            dst[dIdx+1] = clamp((float)(g/wSum), 0.0f, 1.0f);
-            dst[dIdx+2] = clamp((float)(b/wSum), 0.0f, 1.0f);
-            dst[dIdx+3] = clamp((float)(a/wSum), 0.0f, 1.0f);
+            if (ws < 1e-9) ws = 1.0;
+            size_t di = ((size_t)dy * dstW + dx) * 4;
+            dst[di+0] = clamp((float)(r/ws), 0.0f, 1.0f);
+            dst[di+1] = clamp((float)(g/ws), 0.0f, 1.0f);
+            dst[di+2] = clamp((float)(b/ws), 0.0f, 1.0f);
+            dst[di+3] = clamp((float)(a/ws), 0.0f, 1.0f);
         }
     }
 }
 
-// ================================================================
-// scaleFSR2: Main entry point for FSR2 upscaling of a static image.
+// =============================================================================
+// scaleFSR2 — Main entry point
 //
-// Parameters:
-//   input        — source image (uint8 RGBA, inW x inH)
-//   inW, inH     — source dimensions
-//   output       — destination (uint8 RGBA, outW x outH)
-//   outW, outH   — output dimensions
-//   sharpness    — RCAS sharpness in stops (0 = off)
-//   useRcas      — enable RCAS pass
-//   rcasDenoise  — enable RCAS denoise
-//   lfga         — LFGA amount (passed to applyPostProcess)
-//   useTepd      — TEPD dither (passed to applyPostProcess)
-//   depth        — flat depth [0..1] for the virtual scene (default 0.5)
-//   useJitter    — enable Halton jitter frame generation
-//   numFrames    — number of jitter frames to accumulate
-//   jitterMode   — bilinear/bicubic/lanczos3 for sub-pixel shift
-//   enabledPasses — which FSR2 passes to run (all 9 by default)
-// ================================================================
+// input/output: uint8 RGBA
+// inW,inH: source (render) resolution
+// outW,outH: destination (display) resolution
+// =============================================================================
 void scaleFSR2(
     const unsigned char* input, int inW, int inH,
     unsigned char* output, int outW, int outH,
@@ -114,64 +110,57 @@ void scaleFSR2(
     Fsr2JitterMode jitterMode,
     const std::set<int>& enabledPasses)
 {
-    // ── 1. Convert input to float ──
-    size_t inPixels = (size_t)inW * inH;
-    size_t outPixels = (size_t)outW * outH;
-
-    std::vector<float> inputF(inPixels * 4);
-    uint8ToFloat(input, inputF.data(), (int)inPixels);
-
-    // ── 2. Compute render resolution ──
-    // FSR2 upscales from render res to display res.
-    // Render res = input res (the low-res image we want to upscale).
-    // Display res = output res.
-    int renderW = inW, renderH = inH;
+    int renderW  = inW,  renderH  = inH;
     int displayW = outW, displayH = outH;
+    size_t renderPixels  = (size_t)renderW  * renderH;
+    size_t displayPixels = (size_t)displayW * displayH;
 
-    // ── 3. Compute jitter sequence ──
-    int phaseCount = fsr2GetJitterPhaseCount(renderW, displayW);
-    if (!useJitter) phaseCount = 1; // Override: single phase = no jitter variation
+    // Convert input to float
+    std::vector<float> inputF(renderPixels * 4);
+    uint8ToFloat(input, inputF.data(), (int)renderPixels);
 
-    // If numFrames > phaseCount, we cycle the sequence
-    int actualFrames = numFrames;
-    if (actualFrames < 1) actualFrames = 1;
+    // Jitter sequence setup
+    int phaseCount = useJitter ? fsr2GetJitterPhaseCount(renderW, displayW) : 1;
+    int actualFrames = std::max(1, numFrames);
 
     std::cout << "  [FSR2] Render: " << renderW << "x" << renderH
               << " -> Display: " << displayW << "x" << displayH << std::endl;
     std::cout << "  [FSR2] Jitter: " << (useJitter ? "ON" : "OFF")
-              << ", Frames: " << actualFrames
-              << ", JitterPhaseCount: " << phaseCount << std::endl;
+              << "  Frames: " << actualFrames
+              << "  PhaseCount: " << phaseCount << std::endl;
     std::cout << "  [FSR2] Enabled passes: ";
     for (int p : enabledPasses) std::cout << p << " ";
     std::cout << std::endl;
 
-    // ── 4. Build synthetic flat depth buffer ──
-    std::vector<float> depthBuf(inPixels, depth);
+    // Flat depth buffer (uniform scene depth)
+    std::vector<float> depthBuf(renderPixels, depth);
 
-    // ── 5. Build synthetic zero motion vector buffer ──
-    std::vector<float> mvBuf(inPixels * 2, 0.0f);
+    // Zero motion vectors (static scene — jitter delta handled inside accumulate)
+    std::vector<float> mvBuf(renderPixels * 2, 0.0f);
 
-    // ── 6. Create FSR2 context ──
+    // FSR2 context
     Fsr2Context ctx;
     ctx.init(renderW, renderH, displayW, displayH);
 
-    // ── 7. Prepare output buffer (float) ──
-    std::vector<float> displayF(outPixels * 4, 0.0f);
+    // Output buffer (float)
+    std::vector<float> displayF(displayPixels * 4, 0.0f);
 
-    // ── 8. Jitter accumulation loop ──
-    std::vector<float> jitteredFrame(inPixels * 4);
-    std::vector<float> rcasOut(outPixels * 4);
+    // Jittered frame buffer (render res, float)
+    std::vector<float> jitteredFrame(renderPixels * 4);
 
     for (int frameIdx = 0; frameIdx < actualFrames; frameIdx++) {
-        // Compute jitter offset for this frame
+        // Compute Halton jitter offset for this frame
         float jX = 0.0f, jY = 0.0f;
-        if (useJitter && phaseCount > 1) {
+        if (useJitter) {
             fsr2GetJitterOffset(&jX, &jY, frameIdx, phaseCount);
         }
+        // When jitter is OFF: jX=jY=0 every frame.
+        // The jitter delta in fsr2_pass_accumulate will be (0-0)=0, which
+        // means the reprojection is a straight look-up with zero offset —
+        // correct for a static-scene, no-jitter accumulation.
 
-        // Generate the jittered low-res frame
-        // The jitter shifts the source image by (jX, jY) pixels
-        if (useJitter && (std::abs(jX) > 1e-6f || std::abs(jY) > 1e-6f)) {
+        // Generate the jittered frame by shifting the source image
+        if (useJitter && (std::abs(jX) > 1e-7f || std::abs(jY) > 1e-7f)) {
             fsr2ResampleWithShift(inputF.data(), renderW, renderH,
                                    jX, jY,
                                    jitteredFrame.data(),
@@ -180,11 +169,11 @@ void scaleFSR2(
             std::copy(inputF.begin(), inputF.end(), jitteredFrame.begin());
         }
 
-        // Fill dispatch params
+        // Build dispatch params
         Fsr2DispatchParams p;
         p.color          = jitteredFrame.data();
         p.depth          = depthBuf.data();
-        p.motionVectors  = mvBuf.data();
+        p.motionVectors  = mvBuf.data();   // zero — jitter delta added inside accumulate
         p.exposure       = nullptr;
         p.reactive       = nullptr;
         p.transparencyAndComposition = nullptr;
@@ -198,20 +187,22 @@ void scaleFSR2(
         p.motionVectorScaleY = 1.0f;
         p.frameTimeDelta = 16.667f;
         p.sharpness      = (useRcas && enabledPasses.count(FSR2_PASS_RCAS)) ? sharpness : 0.0f;
-        p.enableSharpening = (useRcas && enabledPasses.count(FSR2_PASS_ACCUMULATE_SHARPEN));
-        p.flags          = FSR2_ENABLE_AUTO_EXPOSURE;
-        p.reset          = (frameIdx == 0); // Reset history on first frame
+        p.enableSharpening = enabledPasses.count(FSR2_PASS_ACCUMULATE_SHARPEN) > 0;
+        // Do not set FSR2_ENABLE_AUTO_EXPOSURE for SDR images.
+        // autoExposure stays 1.0, preventing the darkening bug.
+        p.flags          = 0;
+        // Reset history only on the very first frame
+        p.reset          = (frameIdx == 0);
 
-        // Run FSR2
         fsr2Dispatch(ctx, p, enabledPasses, displayF.data(), rcasDenoise);
 
-        // Progress reporting for long accumulations
         if (actualFrames > 8 && (frameIdx + 1) % 8 == 0) {
-            std::cout << "  [FSR2] Accumulated " << (frameIdx + 1) << "/" << actualFrames << " frames..." << std::endl;
+            std::cout << "  [FSR2] Accumulated " << (frameIdx + 1)
+                      << "/" << actualFrames << " frames..." << std::endl;
         }
     }
 
-    // ── 9. Apply post-processing (LFGA, TEPD) to final output ──
+    // Apply post-processing (LFGA, TEPD) to final output
     for (int y = 0; y < displayH; y++) {
         for (int x = 0; x < displayW; x++) {
             size_t idx = ((size_t)y * displayW + x) * 4;
@@ -223,6 +214,6 @@ void scaleFSR2(
         }
     }
 
-    // ── 10. Convert float output to uint8 ──
-    floatToUint8(displayF.data(), output, (int)outPixels);
+    // Convert float to uint8
+    floatToUint8(displayF.data(), output, (int)displayPixels);
 }
