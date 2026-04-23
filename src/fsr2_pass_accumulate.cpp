@@ -3,42 +3,35 @@
 // FSR 2.3.4 CPU Port — Pass 3/4: Temporal Accumulation & Upscaling
 //
 // Ported from: ffx_fsr2_accumulate_pass.hlsl
-//              ffx_fsr2_common.h (Lanczos, tonemapping, SRTM)
+//              ffx_fsr2_common.h (Lanczos-2, SRTM, AABB clip)
 //
-// This is the HEART of FSR 2. What it does:
+// KEY DESIGN DECISIONS (matching the actual FSR2 shader behavior):
 //
-//   1. REPROJECTION: For each output (display-res) pixel, compute where
-//      it "came from" in the previous frame using dilated motion vectors
-//      and the jitter offset. Sample the previous accumulated color there.
+//   1. HISTORY IS STORED LINEAR. We do not tonemap into history.
+//      SRTM is used ONLY for computing the AABB clamp bounds in a
+//      perceptually stable space. The stored and blended values are
+//      always linear [0..1]. This prevents the "darkening over frames"
+//      bug caused by nonlinear compounding across the SRTM round-trip.
 //
-//   2. LANCZOS UPSCALING: The current jittered render-res frame is
-//      sampled using a Lanczos(x,2) kernel centered at the display-res
-//      pixel's sub-pixel position. This is the "upscaling" step.
+//   2. JITTER DELTA IN REPROJECTION. For a static scene with changing
+//      jitter, the reprojection must account for how the jitter changed
+//      between the current and previous frame. The motion vector for
+//      every pixel is: MV = -(currentJitter - previousJitter).
+//      If real motion vectors are provided (3D app), they already encode
+//      this and the jitter delta should be added on top.
+//      This is the fix for the "blur with jitter on" bug.
 //
-//   3. TONEMAPPING: Both history and current color are Reinhard-tonemapped
-//      before blending to prevent HDR colors from dominating the blend.
-//      (FSR 2.2+ uses SRTM — Simple Reversible Tone Mapper)
+//   3. LANCZOS-2 UPSAMPLING from render-res to display-res, with the
+//      jitter offset subtracted to correctly align the sub-pixel grid.
+//      This is the "upscaling" step — identical to the GPU shader.
 //
-//   4. TEMPORAL BLEND: Blend current color with reprojected history.
-//      Blend factor depends on:
-//        - disocclusion mask (no history → use current fully)
-//        - lock mask (locked pixels → higher history weight)
-//        - reactive mask (reactive pixels → less history)
-//        - motion magnitude (fast motion → less history)
+//   4. AABB COLOR CLAMP prevents ghosting. Computed in SRTM space for
+//      stability, then the history is clamped in SRTM space before
+//      blending, and the result is inverse-tonemapped back to linear.
+//      Only the AABB computation touches SRTM — history and output do not.
 //
-//   5. COLOR CLAMP (AABB): History color is clamped to the AABB of
-//      neighbors in the current frame. This prevents ghosting from
-//      long-ago colors leaking through.
-//
-//   6. INVERSE TONEMAP: Convert back to linear after blending.
-//
-//   7. LOCK ACCUMULATION: Track how many frames a pixel has been locked.
-//
-// Static image adaptations:
-//   - Motion vectors = zero → reprojection stays on same location.
-//   - This means FSR2 is effectively accumulating sub-pixel shifted
-//     versions of the same image → genuine temporal super-sampling.
-//   - The Lanczos kernel provides the actual reconstruction quality.
+//   5. BLEND FACTOR: history weight converges toward ~0.9 over ~16 frames.
+//      Disocclusion, lock, and reactive all modulate this weight.
 // =============================================================================
 #include "fsr2_types.h"
 #include "fsr_math.h"
@@ -49,24 +42,25 @@
 // ── Math helpers ─────────────────────────────────────────────────────────────
 
 static inline float luma709(float r, float g, float b) {
+    // Rec.709 luma — matches FSR2's ffx_fsr2_common.h RGBToLuma
     return 0.2126f * r + 0.7152f * g + 0.0722f * b;
 }
 
-// FSR2 uses the Simple Reversible Tone Mapper (SRTM) from ffx_fsr2_common.h
-// for tonemapping before blending. Same as our FsrSrtmF in fsr_math.h.
+// SRTM — used ONLY for AABB computation, never for history storage.
+// Maps linear [0..1+] to [0..1] for stable neighborhood clamping.
 static inline float3 srtmTonemap(float3 c) {
     float m = ffxMax3(c.x, c.y, c.z);
     float rcp = 1.0f / (m + 1.0f);
     return float3(c.x * rcp, c.y * rcp, c.z * rcp);
 }
+
 static inline float3 srtmInverse(float3 c) {
     float m = ffxMax3(c.x, c.y, c.z);
     float rcp = 1.0f / std::max(1.0f / 32768.0f, 1.0f - m);
     return float3(c.x * rcp, c.y * rcp, c.z * rcp);
 }
 
-// Lanczos(x, 2) kernel — from ffx_fsr2_accumulate_pass.hlsl
-// a=2 means the kernel spans 2 lobes (radius = 2 pixels)
+// Lanczos(x, a=2) kernel — matches ffx_fsr2_accumulate_pass.hlsl
 static inline float sincF(float x) {
     if (std::abs(x) < 1e-6f) return 1.0f;
     float px = 3.14159265358979323846f * x;
@@ -78,37 +72,29 @@ static inline float lanczos2(float x) {
     return sincF(x) * sincF(x * 0.5f);
 }
 
-// Sample render-res float RGBA buffer with clamping
-static inline float3 sampleRenderColor(const float* buf, int w, int h, int x, int y) {
-    x = std::max(0, std::min(x, w-1));
-    y = std::max(0, std::min(y, h-1));
+// Safe fetch from render-res float RGBA buffer
+static inline float3 fetchRender(const float* buf, int w, int h, int x, int y) {
+    x = std::max(0, std::min(x, w - 1));
+    y = std::max(0, std::min(y, h - 1));
     size_t idx = ((size_t)y * w + x) * 4;
     return float3(buf[idx], buf[idx+1], buf[idx+2]);
 }
-static inline float sampleRenderAlpha(const float* buf, int w, int h, int x, int y) {
-    x = std::max(0, std::min(x, w-1));
-    y = std::max(0, std::min(h-1, y));
+static inline float fetchRenderAlpha(const float* buf, int w, int h, int x, int y) {
+    x = std::max(0, std::min(x, w - 1));
+    y = std::max(0, std::min(y, h - 1));
     return buf[((size_t)y * w + x) * 4 + 3];
 }
 
-// Sample dilated lock mask at render resolution
-static inline float sampleLock(const float* lockMask, int w, int h, int x, int y) {
-    x = std::max(0, std::min(x, w-1));
-    y = std::max(0, std::min(y, h-1));
-    return lockMask[y * w + x];
-}
-
-// Sample previous accumulated color (display res)
-static inline float3 sampleHistory(const float* hist, int dW, int dH, float px, float py) {
-    // Bilinear sample of history buffer at display res
+// Bilinear fetch from display-res float RGBA history buffer (LINEAR)
+static inline float3 sampleHistoryBilinear(const float* hist, int dW, int dH, float px, float py) {
     int x0 = (int)std::floor(px);
     int y0 = (int)std::floor(py);
     float fx = px - (float)x0;
     float fy = py - (float)y0;
 
     auto fetch = [&](int x, int y) -> float3 {
-        x = std::max(0, std::min(dW-1, x));
-        y = std::max(0, std::min(dH-1, y));
+        x = std::max(0, std::min(dW - 1, x));
+        y = std::max(0, std::min(dH - 1, y));
         size_t i = ((size_t)y * dW + x) * 4;
         return float3(hist[i], hist[i+1], hist[i+2]);
     };
@@ -123,80 +109,102 @@ static inline float3 sampleHistory(const float* hist, int dW, int dH, float px, 
     return top * (1.0f - fy) + bot * fy;
 }
 
-// Compute the 3x3 AABB of current render colors at a render-res location
-// Used for history clip to prevent ghosting
-static void computeColorAABB(
+// Compute 3x3 AABB of current render pixels in SRTM space.
+// The AABB is used to clamp the history to prevent ghosting.
+// We work in SRTM space here for perceptual stability (prevents
+// HDR outliers from over-expanding the AABB).
+static void computeSRTM_AABB(
     const float* colorBuf, int rW, int rH,
-    int centerX, int centerY,
+    int cx, int cy,
     float3& aabbMin, float3& aabbMax)
 {
     aabbMin = float3(1e30f);
     aabbMax = float3(-1e30f);
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
-            int nx = std::max(0, std::min(rW-1, centerX + dx));
-            int ny = std::max(0, std::min(rH-1, centerY + dy));
+            int nx = std::max(0, std::min(rW - 1, cx + dx));
+            int ny = std::max(0, std::min(rH - 1, cy + dy));
             size_t idx = ((size_t)ny * rW + nx) * 4;
             float3 c(colorBuf[idx], colorBuf[idx+1], colorBuf[idx+2]);
-            // Tonemap before AABB for consistent HDR handling
-            c = srtmTonemap(c);
-            aabbMin = min(aabbMin, c);
-            aabbMax = max(aabbMax, c);
+            // Tonemap for AABB only — this value is never stored
+            float3 ct = srtmTonemap(c);
+            aabbMin = min(aabbMin, ct);
+            aabbMax = max(aabbMax, ct);
         }
     }
 }
 
+// ── Main pass ─────────────────────────────────────────────────────────────────
+
 void fsr2PassAccumulate(
-    const float* currentColor,     // render res, float RGBA (jittered)
-    const float* reactiveBuffer,   // render res, float [0..1] or nullptr
+    const float* currentColor,      // render res, float RGBA (jittered)
+    const float* reactiveBuffer,    // render res, float [0..1] or nullptr
     Fsr2InternalBuffers& buf,
-    float sharpness,               // 0 = no built-in sharpen (use RCAS pass)
-    bool enableBuiltinSharpen)     // true = pass 4, false = pass 3
+    float sharpness,
+    bool enableBuiltinSharpen)
 {
     int rW = buf.renderW, rH = buf.renderH;
     int dW = buf.displayW, dH = buf.displayH;
 
-    // Scale factors: how many render pixels per display pixel
     float scaleX = (float)rW / (float)dW;
     float scaleY = (float)rH / (float)dH;
 
-    // Copy current accumulated to previous before overwriting
+    bool isFirstFrame = buf.firstFrame;
+
+    // Copy current accumulated to previous before we overwrite it
     std::copy(buf.accumulatedColor.begin(), buf.accumulatedColor.end(),
               buf.prevAccumulatedColor.begin());
 
-    bool isFirstFrame = buf.firstFrame;
+    // ── Compute jitter delta motion vector ──────────────────────────────────
+    // For a static scene with jitter, the motion between frames is purely
+    // caused by the jitter offset changing. Every pixel has the same MV:
+    //   MV_render = -(currentJitter - previousJitter)
+    // This points from the current frame's position back to where the same
+    // world point was in the previous frame.
+    //
+    // If real motion vectors are provided by a 3D app (via dilatedMotionVectors),
+    // they are used instead. The jitter delta is already baked into real MVs
+    // because the 3D app provides jitter-cancelled motion vectors.
+    //
+    // For our static image case, dilatedMotionVectors are zero (set by
+    // fsr2_context.cpp when pass 1 is disabled, or by pass 1 for a flat scene).
+    // We add the jitter delta on top.
+    float jitterDeltaX = -(buf.jitterX - buf.prevJitterX); // render-res pixels
+    float jitterDeltaY = -(buf.jitterY - buf.prevJitterY);
 
     for (int dy = 0; dy < dH; dy++) {
         for (int dx = 0; dx < dW; dx++) {
             size_t dstIdx = ((size_t)dy * dW + dx) * 4;
 
-            // ── 1. Map display pixel to render-res sub-pixel position ──
-            // Account for jitter offset. The jitter moves the render image
-            // by (jitterX, jitterY) pixels at render resolution.
-            // To undo the jitter when sampling the current frame, we
-            // subtract the jitter from the sampling position.
+            // ── 1. Map display pixel to render-res sub-pixel position ──────
+            // The jitter offset shifts the render image by (jitterX, jitterY)
+            // pixels. We subtract it here to "undo" the jitter and find the
+            // canonical render-space position for this display pixel.
             float srcX = ((float)dx + 0.5f) * scaleX - 0.5f - buf.jitterX;
             float srcY = ((float)dy + 0.5f) * scaleY - 0.5f - buf.jitterY;
 
             int centerRX = (int)std::round(srcX);
             int centerRY = (int)std::round(srcY);
+            int clampedRX = std::max(0, std::min(rW - 1, centerRX));
+            int clampedRY = std::max(0, std::min(rH - 1, centerRY));
 
-            // ── 2. Lanczos-2 upsampling of current jittered frame ──
-            // Sample a 4x4 neighborhood using Lanczos(x,2) kernel
+            // ── 2. Lanczos-2 upsample current jittered frame ───────────────
+            // Sample a 4x4 neighborhood centered at srcX, srcY.
+            // This is the core upscaling step — identical to the FSR2 shader.
             float3 lanczosColor(0.0f);
-            float lanczosAlpha = 0.0f;
-            float lanczosWeight = 0.0f;
+            float  lanczosAlpha = 0.0f;
+            float  lanczosWeight = 0.0f;
 
             for (int ky = -1; ky <= 2; ky++) {
                 float wy = lanczos2(srcY - (float)(centerRY + ky));
                 for (int kx = -1; kx <= 2; kx++) {
                     float wx = lanczos2(srcX - (float)(centerRX + kx));
                     float w = wx * wy;
-                    int sx = std::max(0, std::min(rW-1, centerRX + kx));
-                    int sy = std::max(0, std::min(rH-1, centerRY + ky));
+                    int sx = std::max(0, std::min(rW - 1, centerRX + kx));
+                    int sy = std::max(0, std::min(rH - 1, centerRY + ky));
                     size_t sIdx = ((size_t)sy * rW + sx) * 4;
                     float3 sc(currentColor[sIdx], currentColor[sIdx+1], currentColor[sIdx+2]);
-                    float sa = currentColor[sIdx+3];
+                    float  sa = currentColor[sIdx+3];
                     lanczosColor = lanczosColor + sc * w;
                     lanczosAlpha += sa * w;
                     lanczosWeight += w;
@@ -205,154 +213,131 @@ void fsr2PassAccumulate(
 
             if (lanczosWeight < 1e-6f) lanczosWeight = 1.0f;
             float3 currentPixel = lanczosColor * (1.0f / lanczosWeight);
-            float currentAlpha = lanczosAlpha / lanczosWeight;
+            float  currentAlpha = clamp(lanczosAlpha / lanczosWeight, 0.0f, 1.0f);
+            // Clamp Lanczos output — Lanczos can produce slight over/undershoot
             currentPixel = saturate(currentPixel);
 
-            // ── 3. Apply exposure before blending ──
-            float3 exposedCurrent = currentPixel * buf.autoExposure;
-
-            // ── 4. Tonemap current for stable blending ──
-            float3 tonemappedCurrent = srtmTonemap(exposedCurrent);
-
-            // ── 5. AABB of current color (at render res) for history clip ──
+            // ── 3. Compute AABB in SRTM space for ghosting prevention ──────
+            // This is used to clamp history color, preventing old colors from
+            // dominating the blend when the scene changes (or between jitter frames).
             float3 aabbMin, aabbMax;
-            computeColorAABB(currentColor, rW, rH, centerRX, centerRY, aabbMin, aabbMax);
+            computeSRTM_AABB(currentColor, rW, rH, clampedRX, clampedRY, aabbMin, aabbMax);
 
-            // ── 6. Reprojection: find previous pixel location ──
-            // Map dilated motion vector from render-res to display-res
-            int renderX = std::max(0, std::min(rW-1, centerRX));
-            int renderY = std::max(0, std::min(rH-1, centerRY));
-            int rIdx = renderY * rW + renderX;
-
-            float mvX = buf.dilatedMotionVectorsX[rIdx]; // in render-res pixels
+            // ── 4. Reprojection: find this pixel's location in previous frame ──
+            // Get the dilated motion vector at this render-res location.
+            // This is either from pass 1 (real MV from 3D app) or zero (static).
+            int rIdx = clampedRY * rW + clampedRX;
+            float mvX = buf.dilatedMotionVectorsX[rIdx]; // render-res pixels
             float mvY = buf.dilatedMotionVectorsY[rIdx];
 
-            // Convert motion vector to display resolution
+            // Add jitter delta so the reprojection lands correctly when
+            // the jitter offset changed between frames.
+            mvX += jitterDeltaX;
+            mvY += jitterDeltaY;
+
+            // Convert motion vector from render-res to display-res pixels
             float mvDispX = mvX / scaleX;
             float mvDispY = mvY / scaleY;
 
-            // Previous pixel position in display space
-            float prevDispX = (float)dx - mvDispX;
-            float prevDispY = (float)dy - mvDispY;
+            // Previous position in display space
+            float prevDispX = (float)dx + mvDispX;
+            float prevDispY = (float)dy + mvDispY;
 
-            // ── 7. Sample history at reprojected position ──
-            float3 histColor(0.0f);
+            // ── 5. Sample history at reprojected position ──────────────────
+            // History is stored LINEAR. No tonemap on the stored values.
+            float3 histColorLinear(0.0f);
             bool hasHistory = !isFirstFrame &&
-                              prevDispX >= 0.0f && prevDispX < (float)(dW-1) &&
-                              prevDispY >= 0.0f && prevDispY < (float)(dH-1);
+                              prevDispX >= 0.0f && prevDispX < (float)(dW - 1) &&
+                              prevDispY >= 0.0f && prevDispY < (float)(dH - 1);
 
             if (hasHistory) {
-                histColor = sampleHistory(buf.prevAccumulatedColor.data(), dW, dH, prevDispX, prevDispY);
-                // History is already tonemapped from previous frame's output
-                // In FSR 2.2+ the history is stored pre-tonemapped.
-                // We keep it pre-tonemapped here too.
+                histColorLinear = sampleHistoryBilinear(
+                    buf.prevAccumulatedColor.data(), dW, dH, prevDispX, prevDispY);
             }
 
-            // ── 8. Clip history to AABB to prevent ghosting ──
-            float3 clippedHistory = clamp(histColor, aabbMin, aabbMax);
+            // ── 6. Clip history to AABB (in SRTM space) ────────────────────
+            // Tonemap history into SRTM space, clamp to AABB, then invert.
+            // This prevents ghosting without darkening the accumulated result.
+            float3 histSRTM = srtmTonemap(histColorLinear);
+            float3 clippedHistSRTM = clamp(histSRTM, aabbMin, aabbMax);
+            float3 clippedHistLinear = srtmInverse(clippedHistSRTM);
 
-            // ── 9. Compute blend factor ──
-            // Base blend: lerp between current and history
-            // More frames = more history weight (converges to ~95%)
-            float lockVal = sampleLock(buf.lockMask.data(), rW, rH, renderX, renderY);
+            // ── 7. Compute blend factor ─────────────────────────────────────
+            float lockVal      = buf.lockMask[rIdx];
             float disocclusion = buf.disocclusionMask[rIdx];
+            float reactive     = reactiveBuffer ? reactiveBuffer[rIdx] : 0.0f;
 
-            // Get reactive value
-            float reactive = 0.0f;
-            if (reactiveBuffer) {
-                reactive = reactiveBuffer[rIdx];
-            }
-
-            // Accumulation blend factor:
-            // - First frame: use 100% current
-            // - Disoccluded pixels: mostly current (history is wrong)
-            // - Locked pixels: mostly history (stable, don't disturb)
-            // - Reactive pixels: less history (they change often)
-            // FSR2 uses a convergence speed based on frame count:
-            // blendFactor approaches maxHistoryWeight as frameIndex increases
-            const float kMinHistoryWeight = 0.0f;
-            const float kMaxHistoryWeight = 0.91f; // ~11 frames to convergence
-            const float kLockBoost = 0.05f;       // Extra history weight for locked pixels
-            const float kReactivePenalty = 0.5f;  // Reduce history for reactive pixels
+            // History weight converges to kMaxHistoryWeight over ~16 frames.
+            // Formula: weight = maxWeight * (1 - exp(-frameIndex * speed))
+            // At frame 16: 1 - exp(-16*0.2) ≈ 0.96 → clamped to 0.91
+            const float kMaxHistoryWeight  = 0.91f;
+            const float kConvergenceSpeed  = 0.2f;
 
             float frameConvergence = 0.0f;
             if (!isFirstFrame && buf.frameIndex > 0) {
-                // Smooth convergence: weight increases each frame up to max
-                // Matches AMD's accumulation speed curve
-                frameConvergence = 1.0f - std::exp(-(float)std::min(buf.frameIndex, 32) * 0.15f);
+                frameConvergence = 1.0f - std::exp(
+                    -(float)buf.frameIndex * kConvergenceSpeed);
             }
 
-            float historyWeight = lerp(kMinHistoryWeight, kMaxHistoryWeight, frameConvergence);
+            float historyWeight = kMaxHistoryWeight * frameConvergence;
 
-            // Disocclusion kills history
+            // Disocclusion kills history (newly revealed pixels have no valid history)
             historyWeight *= disocclusion;
 
-            // Lock adds extra history stability
-            historyWeight = std::min(historyWeight + lockVal * kLockBoost, kMaxHistoryWeight + kLockBoost);
+            // Lock: stable pixels keep more history (protects fine detail)
+            // Small additive boost capped so we never exceed 0.95
+            historyWeight = std::min(historyWeight + lockVal * 0.04f, 0.95f);
 
-            // Reactive reduces history
-            historyWeight *= (1.0f - reactive * kReactivePenalty);
+            // Reactive: animated/transparent pixels use less history
+            historyWeight *= (1.0f - reactive * 0.5f);
 
-            historyWeight = clamp(historyWeight, 0.0f, 0.99f);
+            historyWeight = clamp(historyWeight, 0.0f, 0.95f);
             float currentWeight = 1.0f - historyWeight;
 
-            // ── 10. Blend current + history ──
-            float3 blended = tonemappedCurrent * currentWeight + clippedHistory * historyWeight;
+            // ── 8. Blend in LINEAR space ────────────────────────────────────
+            // Both currentPixel and clippedHistLinear are linear [0..1].
+            // Blending linear values gives a linear result — no darkening.
+            float3 blended = currentPixel * currentWeight + clippedHistLinear * historyWeight;
+            blended = saturate(blended);
 
-            // ── 11. Optional built-in sharpening (Pass 4) ──
-            // Pass 4 applies a mild sharpening to the blended result before
-            // storing. In practice, RCAS (Pass 5) is preferred; Pass 4 is
-            // an older path. We apply a simple unsharp mask here.
+            // ── 9. Optional built-in sharpen (Pass 4) ──────────────────────
+            // Applied as a mild unsharp mask on the blended linear result.
+            // For best quality, use RCAS (Pass 5) instead.
             if (enableBuiltinSharpen && sharpness > 0.0f) {
-                // Simple Laplacian sharpen on the tonemapped blended result
-                float3 center = blended;
-                // Sample 4 tonemapped neighbors from history for sharpening reference
-                // (Using the blended result as-is, applying unsharp mask)
-                // This is a simplification of the built-in sharpen path.
-                // For best quality, use RCAS (Pass 5) instead.
-                float3 sharpened = center * (1.0f + sharpness) - blended * sharpness;
-                blended = clamp(sharpened, float3(0.0f), float3(1.0f));
+                // Unsharp mask: sharpen = center + strength * (center - local_avg)
+                // We approximate local_avg using the AABB midpoint in linear space
+                float3 aabbMidSRTM = (aabbMin + aabbMax) * 0.5f;
+                float3 localAvgLinear = srtmInverse(aabbMidSRTM);
+                float3 sharpened = blended + (blended - localAvgLinear) * sharpness;
+                blended = saturate(sharpened);
             }
 
-            // ── 12. Inverse tonemap for storage ──
-            // Store tonemapped in history, undo for final output
-            // In FSR 2.2+ the history is stored POST-tonemap for stability.
-            // The output to the next pass is PRE-inverse-tonemap (linear).
-            float3 finalLinear = srtmInverse(blended);
-
-            // Undo exposure for final output
-            float rcpExposure = (buf.autoExposure > 1e-6f) ? 1.0f / buf.autoExposure : 1.0f;
-            float3 finalColor = finalLinear * rcpExposure;
-            finalColor = saturate(finalColor);
-
-            // ── 13. Store results ──
-            // History stores the tonemapped blended result (pre-inverse-tonemap)
+            // ── 10. Store results ───────────────────────────────────────────
+            // accumulatedColor: LINEAR, used as history next frame
             buf.accumulatedColor[dstIdx + 0] = blended.x;
             buf.accumulatedColor[dstIdx + 1] = blended.y;
             buf.accumulatedColor[dstIdx + 2] = blended.z;
             buf.accumulatedColor[dstIdx + 3] = currentAlpha;
 
-            // Output buffer: linear, ready for RCAS or direct output
-            buf.internalColorHistory[dstIdx + 0] = finalColor.x;
-            buf.internalColorHistory[dstIdx + 1] = finalColor.y;
-            buf.internalColorHistory[dstIdx + 2] = finalColor.z;
+            // internalColorHistory: linear output for RCAS or direct write
+            buf.internalColorHistory[dstIdx + 0] = blended.x;
+            buf.internalColorHistory[dstIdx + 1] = blended.y;
+            buf.internalColorHistory[dstIdx + 2] = blended.z;
             buf.internalColorHistory[dstIdx + 3] = currentAlpha;
         }
     }
 
-    // Update lock accumulation buffer (display res)
-    // Propagate lock stability from render-res to display-res
+    // ── Propagate lock from render-res to display-res ──────────────────────
     for (int dy = 0; dy < dH; dy++) {
         for (int dx = 0; dx < dW; dx++) {
-            int renderX = std::min(rW-1, (int)((float)dx * scaleX));
-            int renderY = std::min(rH-1, (int)((float)dy * scaleY));
-            float lockVal = buf.lockMask[renderY * rW + renderX];
-            size_t dstIdx = (size_t)dy * dW + dx;
+            int renderX = std::min(rW - 1, (int)((float)dx * scaleX));
+            int renderY = std::min(rH - 1, (int)((float)dy * scaleY));
+            float lockVal = buf.lockMask[(size_t)renderY * rW + renderX];
+            size_t dIdx = (size_t)dy * dW + dx;
             if (isFirstFrame) {
-                buf.lockAccum[dstIdx] = lockVal;
+                buf.lockAccum[dIdx] = lockVal;
             } else {
-                // Exponential moving average of lock
-                buf.lockAccum[dstIdx] = buf.lockAccum[dstIdx] * 0.9f + lockVal * 0.1f;
+                buf.lockAccum[dIdx] = buf.lockAccum[dIdx] * 0.9f + lockVal * 0.1f;
             }
         }
     }
