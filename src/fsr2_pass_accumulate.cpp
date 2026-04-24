@@ -3,33 +3,37 @@
 // FSR 2.3.4 CPU Port — Pass 3/4: Temporal Accumulation & Upscaling
 //
 // Ported from: ffx_fsr2_accumulate_pass.hlsl
-//              ffx_fsr2_common.h (Lanczos-2, SRTM, variance AABB clip)
+//              ffx_fsr2_common.h (Lanczos-2, SRTM, AABB clip)
 //
-// KEY DESIGN DECISIONS (matching the actual FSR2 shader behavior):
+// KEY DESIGN DECISIONS (faithful to the original FSR2 shader):
 //
 //   1. HISTORY IS STORED LINEAR. SRTM is used ONLY transiently for AABB
 //      computation. Stored and blended values are always linear [0..1].
+//      This prevents the darkening-over-frames bug.
 //
 //   2. JITTER OFFSET IS ADDED (+) when computing srcX/srcY.
 //      fsr2ResampleWithShift with shiftX=jX places original pixel p into
-//      buffer position p+jX. To recover p from the buffer, sample at p+jX.
+//      buffer position p+jX. To recover original position p from the jittered
+//      buffer, sample at p+jX (not p-jX).
 //
 //   3. NO JITTER DELTA IN MOTION VECTOR REPROJECTION.
 //      Display-space reprojection is independent of sub-pixel jitter.
-//      FSR2 requires jitter-cancelled MVs from the application.
-//      Zero MVs are already correct for a static scene.
+//      FSR2 requires jitter-cancelled MVs from the application. Zero MVs
+//      are already correct for a static scene.
 //
-//   4. VARIANCE-BASED AABB CLAMP (mean ± gamma*stddev in SRTM space).
-//      This is what FSR2 actually uses. Hard min/max AABB is too aggressive
-//      for jittered accumulation: it clips valid temporally-accumulated colors
-//      that differ slightly from the current frame's 3x3 neighborhood due to
-//      sub-pixel shift. Variance clamping allows valid history to survive
-//      while still catching true ghosting (large deviations from the mean).
-//      gamma=1.0 gives 1-sigma clamping. Lower = tighter (more anti-ghost,
-//      less accumulation). Higher = softer (more accumulation, less anti-ghost).
+//   4. AABB IS COMPUTED FROM RAW RENDER-RES NEIGHBORS (hard min/max in SRTM
+//      space). This matches the original FSR2 shader exactly and is correct
+//      for both static images and real 3D scenes. It is a fast 3x3 raw fetch,
+//      not a Lanczos upsample — keeping it faithful and performant.
 //
-//   5. BLEND FACTOR converges toward ~0.91 over ~16 frames, modulated
-//      by disocclusion, lock, and reactive masks.
+//   5. BLEND FACTOR converges toward ~0.91 over ~16 frames, modulated by
+//      disocclusion, lock, and reactive masks.
+//
+//   NOTE ON SHARPNESS WITH JITTER ON:
+//      Temporal accumulation without sharpening is deliberately softer than
+//      a single-frame upscale. This is correct FSR2 behavior. RCAS (Pass 5)
+//      recovers and enhances the detail that accumulation softens. For best
+//      results with jitter ON, run with --fsr2-rcas on --fsr2-sharpness 0.2.
 // =============================================================================
 #include "fsr2_types.h"
 #include "fsr_math.h"
@@ -45,7 +49,8 @@ static inline float luma709(float r, float g, float b) {
 }
 
 // SRTM — used ONLY for AABB computation, NEVER for history storage.
-// Maps linear [0..∞) to [0..1) for perceptually stable clamping.
+// Maps linear [0..∞) to [0..1) for perceptually stable min/max clamping.
+// Prevents HDR color outliers from over-expanding the AABB bounds.
 static inline float3 srtmTonemap(float3 c) {
     float m = ffxMax3(c.x, c.y, c.z);
     float rcp = 1.0f / (m + 1.0f);
@@ -59,7 +64,7 @@ static inline float3 srtmInverse(float3 c) {
 }
 
 // Lanczos(x, a=2) kernel — matches ffx_fsr2_accumulate_pass.hlsl exactly.
-// a=2: 4-tap kernel, radius = 2 render pixels.
+// a=2: 4-tap kernel (radius 2 render pixels each side).
 static inline float sincF(float x) {
     if (std::abs(x) < 1e-6f) return 1.0f;
     const float kPi = 3.14159265358979323846f;
@@ -72,15 +77,42 @@ static inline float lanczos2(float x) {
     return sincF(x) * sincF(x * 0.5f);
 }
 
-// Clamped fetch from render-resolution float RGBA buffer
-static inline float3 fetchRender(const float* buf, int w, int h, int x, int y) {
-    x = std::max(0, std::min(x, w - 1));
-    y = std::max(0, std::min(y, h - 1));
-    size_t idx = ((size_t)y * w + x) * 4;
-    return float3(buf[idx], buf[idx+1], buf[idx+2]);
+// ── AABB from render-res raw neighbors (faithful to FSR2) ─────────────────────
+//
+// Computes hard min/max of the 3x3 render-res neighborhood centered at
+// (cx, cy), in SRTM tonemapped space. This is exactly what the original
+// FSR2 accumulate shader does:
+//   - Fast: 9 raw texture fetches, no upsampling
+//   - Correct for 3D scenes: each render-res pixel represents one world sample
+//   - Correct for static images: same neighborhood, same bounds every frame
+//     when there is no jitter (jitter-OFF 64-frame case is stable)
+//
+// The AABB is used to clamp history and prevent ghosting. Values within the
+// current frame's local color range are kept; stale out-of-range values are
+// clipped toward the nearest in-range color.
+static void computeRenderSpaceAABB(
+    const float* colorBuf, int rW, int rH,
+    int cx, int cy,
+    float3& aabbMin, float3& aabbMax)
+{
+    aabbMin = float3( 1e30f);
+    aabbMax = float3(-1e30f);
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = std::max(0, std::min(rW - 1, cx + dx));
+            int ny = std::max(0, std::min(rH - 1, cy + dy));
+            size_t idx = ((size_t)ny * rW + nx) * 4;
+            float3 c(colorBuf[idx], colorBuf[idx+1], colorBuf[idx+2]);
+            // Tonemap to SRTM space — this value is transient, never stored
+            float3 ct = srtmTonemap(c);
+            aabbMin = min(aabbMin, ct);
+            aabbMax = max(aabbMax, ct);
+        }
+    }
 }
 
-// Bilinear fetch from display-resolution float RGBA history buffer (LINEAR)
+// ── Bilinear fetch from display-res float RGBA history buffer (LINEAR) ─────────
 static inline float3 sampleHistoryBilinear(const float* hist, int dW, int dH,
                                             float px, float py) {
     int x0 = (int)std::floor(px);
@@ -102,64 +134,6 @@ static inline float3 sampleHistoryBilinear(const float* hist, int dW, int dH,
     float3 top = c00 * (1.0f - fx) + c10 * fx;
     float3 bot = c01 * (1.0f - fx) + c11 * fx;
     return top * (1.0f - fy) + bot * fy;
-}
-
-// ── Variance-based AABB computation ──────────────────────────────────────────
-//
-// Computes mean and per-channel standard deviation of the 3x3 render-res
-// neighborhood in SRTM space. Returns AABB as (mean - gamma*stddev,
-// mean + gamma*stddev). This is the approach used by FSR2 and TAA
-// implementations to avoid over-clamping temporally accumulated results.
-//
-// gamma = 1.0 → 1-sigma clamp (default, matches FSR2 behavior)
-//   Lower gamma → tighter clamp → more anti-ghosting, less accumulation
-//   Higher gamma → softer clamp → more accumulation, less anti-ghosting
-//
-// For a static jittered scene, the 3x3 neighborhood has low variance in
-// flat regions, so the clamp is tight but the history is still within it
-// (because it's also a version of the same flat region, just from a
-// different sub-pixel angle). At edges, variance is higher and the clamp
-// is wider, allowing the sharpened edge from accumulation to survive.
-static void computeVarianceAABB(
-    const float* colorBuf, int rW, int rH,
-    int cx, int cy,
-    float3& aabbMin, float3& aabbMax,
-    float gamma = 1.0f)
-{
-    // Gather all 9 neighborhood samples in SRTM space
-    float3 samples[9];
-    int sampleCount = 0;
-    float3 mean(0.0f);
-
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            int nx = std::max(0, std::min(rW - 1, cx + dx));
-            int ny = std::max(0, std::min(rH - 1, cy + dy));
-            size_t idx = ((size_t)ny * rW + nx) * 4;
-            float3 c(colorBuf[idx], colorBuf[idx+1], colorBuf[idx+2]);
-            // Tonemap to SRTM space for stable variance computation
-            float3 cs = srtmTonemap(c);
-            samples[sampleCount++] = cs;
-            mean = mean + cs;
-        }
-    }
-
-    // Mean
-    float rcpCount = 1.0f / (float)sampleCount;
-    mean = mean * rcpCount;
-
-    // Per-channel variance → standard deviation
-    float3 variance(0.0f);
-    for (int i = 0; i < sampleCount; i++) {
-        float3 diff = samples[i] - mean;
-        variance = variance + float3(diff.x * diff.x, diff.y * diff.y, diff.z * diff.z);
-    }
-    variance = variance * rcpCount;
-    float3 stddev(std::sqrt(variance.x), std::sqrt(variance.y), std::sqrt(variance.z));
-
-    // AABB = mean ± gamma * stddev, clamped to [0..1] (SRTM space is [0..1))
-    aabbMin = max(mean - stddev * gamma, float3(0.0f));
-    aabbMax = min(mean + stddev * gamma, float3(1.0f));
 }
 
 // ── Main pass ─────────────────────────────────────────────────────────────────
@@ -191,12 +165,12 @@ void fsr2PassAccumulate(
             // ── 1. Map display pixel to render-res sub-pixel position ──────
             //
             // Standard display→render mapping:
-            //   renderPos = (displayPixel + 0.5) * scale - 0.5
+            //   srcX = (dx + 0.5) * scaleX - 0.5
             //
-            // The jitter frame generator (fsr2ResampleWithShift with shiftX=jX)
-            // places original pixel p into buffer position p + jX. So to sample
-            // the jittered buffer at the correct position for this display pixel,
-            // we ADD the jitter offset (not subtract).
+            // Then ADD jitter offset. fsr2ResampleWithShift with shiftX=jX
+            // places original pixel p into buffer position p+jX. To sample
+            // original world position p from the jittered buffer, read at
+            // p+jX (adding the jitter, not subtracting).
             float srcX = ((float)dx + 0.5f) * scaleX - 0.5f + buf.jitterX;
             float srcY = ((float)dy + 0.5f) * scaleY - 0.5f + buf.jitterY;
 
@@ -205,13 +179,13 @@ void fsr2PassAccumulate(
             int clampedRX = std::max(0, std::min(rW - 1, centerRX));
             int clampedRY = std::max(0, std::min(rH - 1, centerRY));
 
-            // ── 2. Lanczos-2 upsample current jittered frame ───────────────
+            // ── 2. Lanczos-2 upsample of current jittered frame ───────────
             //
             // Sample a 4x4 render-res neighborhood using Lanczos(x,2) kernel
-            // centered at srcX, srcY. This is the core upscaling step.
-            // Each frame's srcX/srcY includes a different jitter offset,
-            // so each frame hits a slightly different sub-pixel position.
-            // When accumulated correctly, this produces super-resolution.
+            // centered at srcX, srcY. This is the core upscaling step,
+            // identical to the FSR2 accumulate shader.
+            // srcX/srcY includes the jitter offset so each frame hits a
+            // different sub-pixel position → temporal super-resolution.
             float3 lanczosColor(0.0f);
             float  lanczosAlpha  = 0.0f;
             float  lanczosWeight = 0.0f;
@@ -238,39 +212,40 @@ void fsr2PassAccumulate(
             // Clamp Lanczos output — Lanczos produces slight ringing at edges
             currentPixel = saturate(currentPixel);
 
-            // ── 3. Variance-based AABB in SRTM space for ghosting prevention ─
+            // ── 3. AABB from render-res raw neighbors (faithful to FSR2) ───
             //
-            // Uses mean ± gamma*stddev of the 3x3 render-res neighborhood
-            // (in SRTM space) rather than a hard min/max.
+            // Hard min/max of the 3x3 render-res neighborhood in SRTM space.
+            // This is exactly what the original FSR2 accumulate shader does:
+            // fast (9 raw fetches), correct for 3D scenes (each render-res
+            // pixel = one world sample), and stable for jitter-OFF static
+            // images (history == current → never clipped).
             //
-            // WHY: Hard min/max AABB clips valid temporally-accumulated colors
-            // when jitter is active, because the accumulated history (blending
-            // multiple sub-pixel positions) naturally falls slightly outside the
-            // hard min/max of any single jittered frame's 3x3 neighborhood.
-            // Variance clamping is soft enough to allow valid accumulation to
-            // survive while still catching true ghosting (large deviations).
-            //
-            // gamma=1.0: 1-sigma clamp, matches FSR2 / standard TAA behavior.
+            // For jitter ON: the accumulated history (blend of multiple
+            // sub-pixel Lanczos-2 samples) may fall slightly outside this box
+            // at edges, causing mild softening. This is expected behavior —
+            // RCAS (Pass 5) sharpening is the intended way to recover edge
+            // detail after temporal accumulation.
             float3 aabbMin, aabbMax;
-            computeVarianceAABB(currentColor, rW, rH, clampedRX, clampedRY,
-                                aabbMin, aabbMax, 1.0f);
+            computeRenderSpaceAABB(currentColor, rW, rH,
+                                   clampedRX, clampedRY,
+                                   aabbMin, aabbMax);
 
-            // ── 4. Reprojection: find this display pixel in previous history ─
+            // ── 4. Reprojection: find display pixel in previous history ────
             //
-            // For a static scene: the world point at display pixel (dx,dy) is
-            // at the same display position in every frame regardless of jitter.
-            // MV = 0, prevDispX = dx. This is correct for zero motion vectors.
-            //
-            // For a 3D app: dilated MVs from pass 1 are used (jitter-cancelled
-            // by the engine, used directly without any jitter delta added).
-            int   rIdx   = clampedRY * rW + clampedRX;
-            float mvRX   = buf.dilatedMotionVectorsX[rIdx]; // render-res pixels
-            float mvRY   = buf.dilatedMotionVectorsY[rIdx];
+            // For a static scene: MV = 0, prevDispX = dx (same position).
+            // For a 3D app: dilated MVs from pass 1 (jitter-cancelled by
+            // the engine per FSR2 spec). No jitter delta is added here —
+            // reprojection is in display space, independent of sub-pixel
+            // jitter. The jitter only affects srcX/srcY (step 1 above).
+            int   rIdx    = clampedRY * rW + clampedRX;
+            float mvRX    = buf.dilatedMotionVectorsX[rIdx]; // render-res pixels
+            float mvRY    = buf.dilatedMotionVectorsY[rIdx];
 
             // Convert MV from render space to display space
             float mvDispX = mvRX / scaleX;
             float mvDispY = mvRY / scaleY;
 
+            // Previous display position (MV points current→previous)
             float prevDispX = (float)dx + mvDispX;
             float prevDispY = (float)dy + mvDispY;
 
@@ -279,28 +254,35 @@ void fsr2PassAccumulate(
             bool hasHistory = !isFirstFrame &&
                               prevDispX >= 0.0f && prevDispX < (float)(dW - 1) &&
                               prevDispY >= 0.0f && prevDispY < (float)(dH - 1);
-
             if (hasHistory) {
                 histColorLinear = sampleHistoryBilinear(
                     buf.prevAccumulatedColor.data(), dW, dH,
                     prevDispX, prevDispY);
             }
 
-            // ── 6. Clip history to variance AABB (in SRTM space) ───────────
+            // ── 6. Clip history to AABB (in SRTM space) ───────────────────
             //
-            // Tonemap history to SRTM, clamp to [mean-σ, mean+σ], invert.
-            // Valid accumulated colors survive. True ghosting is clipped.
+            // Tonemap history to SRTM space → clamp to render-res AABB →
+            // inverse tonemap back to linear. Only the AABB clamping uses
+            // SRTM; the stored and blended values remain linear throughout.
+            // Valid accumulated colors within the current neighborhood range
+            // pass through. Stale ghosted colors are clipped toward the
+            // nearest in-range color.
             float3 histSRTM          = srtmTonemap(histColorLinear);
             float3 clippedHistSRTM   = clamp(histSRTM, aabbMin, aabbMax);
             float3 clippedHistLinear = srtmInverse(clippedHistSRTM);
 
             // ── 7. Compute blend factor ─────────────────────────────────────
+            //
+            // History weight converges toward kMaxHistoryWeight over ~16
+            // frames using an exponential curve. Modulated by:
+            //   - disocclusion: newly revealed pixels have no valid history
+            //   - lock: stable pixels benefit from slightly more history
+            //   - reactive: animated/transparent content uses less history
             float lockVal      = buf.lockMask[rIdx];
             float disocclusion = buf.disocclusionMask[rIdx];
             float reactive     = reactiveBuffer ? reactiveBuffer[rIdx] : 0.0f;
 
-            // Convergence: weight = maxWeight * (1 - exp(-frameIndex * speed))
-            // At frameIndex=16: 1-exp(-16*0.2) = 0.96 → clamped to maxWeight
             const float kMaxHistoryWeight = 0.91f;
             const float kConvergenceSpeed = 0.2f;
 
@@ -311,17 +293,10 @@ void fsr2PassAccumulate(
             }
 
             float historyWeight = kMaxHistoryWeight * frameConvergence;
-
-            // Disocclusion: newly revealed pixels have no valid history
             historyWeight *= disocclusion;
-
-            // Lock: stable pixels benefit from slightly more history
-            historyWeight = std::min(historyWeight + lockVal * 0.04f, 0.95f);
-
-            // Reactive: animated/transparent content uses less history
+            historyWeight  = std::min(historyWeight + lockVal * 0.04f, 0.95f);
             historyWeight *= (1.0f - reactive * 0.5f);
-
-            historyWeight = clamp(historyWeight, 0.0f, 0.95f);
+            historyWeight  = clamp(historyWeight, 0.0f, 0.95f);
             float currentWeight = 1.0f - historyWeight;
 
             // ── 8. Blend in LINEAR space ────────────────────────────────────
@@ -334,18 +309,20 @@ void fsr2PassAccumulate(
             blended = saturate(blended);
 
             // ── 9. Optional built-in sharpen (Pass 4) ──────────────────────
+            //
+            // Mild unsharp mask on the blended linear result.
+            // For best quality, prefer RCAS (Pass 5) instead.
             if (enableBuiltinSharpen && sharpness > 0.0f) {
-                // Mild unsharp mask. Local average from AABB midpoint (linear).
                 float3 aabbMidSRTM    = (aabbMin + aabbMax) * 0.5f;
                 float3 localAvgLinear = srtmInverse(aabbMidSRTM);
-                float3 sharpened = blended + (blended - localAvgLinear) * sharpness;
-                blended = saturate(sharpened);
+                blended = saturate(blended + (blended - localAvgLinear) * sharpness);
             }
 
-            // ── 10. Store results ───────────────────────────────────────────
-            // Both buffers store LINEAR values. accumulatedColor becomes
-            // prevAccumulatedColor next frame. internalColorHistory goes to
-            // RCAS (pass 5) or directly to output.
+            // ── 10. Store results LINEAR ────────────────────────────────────
+            //
+            // accumulatedColor: becomes prevAccumulatedColor next frame.
+            // internalColorHistory: goes to RCAS (pass 5) or direct output.
+            // Both store LINEAR values — no tonemap is ever stored.
             buf.accumulatedColor[dstIdx + 0] = blended.x;
             buf.accumulatedColor[dstIdx + 1] = blended.y;
             buf.accumulatedColor[dstIdx + 2] = blended.z;
@@ -365,11 +342,9 @@ void fsr2PassAccumulate(
             int    renderY = std::min(rH - 1, (int)((float)dy * scaleY));
             float  lockVal = buf.lockMask[(size_t)renderY * rW + renderX];
             size_t dIdx    = (size_t)dy * dW + dx;
-            if (isFirstFrame) {
-                buf.lockAccum[dIdx] = lockVal;
-            } else {
-                buf.lockAccum[dIdx] = buf.lockAccum[dIdx] * 0.9f + lockVal * 0.1f;
-            }
+            buf.lockAccum[dIdx] = isFirstFrame
+                ? lockVal
+                : buf.lockAccum[dIdx] * 0.9f + lockVal * 0.1f;
         }
     }
 }
