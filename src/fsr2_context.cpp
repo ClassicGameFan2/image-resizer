@@ -41,7 +41,6 @@ void fsr2Dispatch(
     size_t dSize = (size_t)dW * dH;
 
     // ── Synthetic inputs for static image mode ────────────────────────────
-    // Depth: uniform flat plane (user-specified, default 0.5)
     std::vector<float> syntheticDepth;
     const float* depthBuf = params.depth;
     if (!depthBuf) {
@@ -49,10 +48,6 @@ void fsr2Dispatch(
         depthBuf = syntheticDepth.data();
     }
 
-    // Motion vectors: zero (static scene).
-    // The jitter-delta compensation is handled INSIDE fsr2PassAccumulate
-    // by reading buf.jitterX/prevJitterX, so we do not add it here.
-    // If a 3D app supplies real motion vectors, those are used as-is.
     std::vector<float> syntheticMV;
     const float* mvBuf = params.motionVectors;
     if (!mvBuf) {
@@ -60,7 +55,6 @@ void fsr2Dispatch(
         mvBuf = syntheticMV.data();
     }
 
-    // Reactive: zero mask (no transparent/reactive objects in static images)
     std::vector<float> syntheticReactive;
     const float* reactiveBuf = params.reactive;
     if (!reactiveBuf) {
@@ -73,8 +67,7 @@ void fsr2Dispatch(
         fsr2PassComputeLuminancePyramid(params.color, buf, autoExp);
     } else {
         buf.autoExposure = 1.0f;
-        // Still need to populate luminanceCurrent for the lock pass
-        // (it uses per-pixel luma, not the auto-exposure scalar)
+        // Still populate luminanceCurrent for the lock pass
         int count = rW * rH;
         std::copy(buf.luminanceCurrent.begin(), buf.luminanceCurrent.end(),
                   buf.luminancePrevious.begin());
@@ -90,19 +83,17 @@ void fsr2Dispatch(
     if (enabledPasses.count(FSR2_PASS_RECONSTRUCT_PREVIOUS_DEPTH)) {
         fsr2PassReconstructPreviousDepth(depthBuf, mvBuf, buf);
     } else {
-        // Neutral: copy depth as-is, use provided motion vectors unchanged
         for (size_t i = 0; i < rSize; i++) {
-            buf.dilatedDepth[i] = depthBuf[i];
-            buf.dilatedMotionVectorsX[i] = mvBuf[i * 2 + 0];
-            buf.dilatedMotionVectorsY[i] = mvBuf[i * 2 + 1];
+            buf.dilatedDepth[i]            = depthBuf[i];
+            buf.dilatedMotionVectorsX[i]   = mvBuf[i * 2 + 0];
+            buf.dilatedMotionVectorsY[i]   = mvBuf[i * 2 + 1];
         }
     }
 
-    // ── Pass 0: Depth Clip (Disocclusion Detection) ────────────────────────
+    // ── Pass 0: Depth Clip ─────────────────────────────────────────────────
     if (enabledPasses.count(FSR2_PASS_DEPTH_CLIP)) {
         fsr2PassDepthClip(depthBuf, buf);
     } else {
-        // Neutral: all pixels have valid history (no disocclusion)
         std::fill(buf.disocclusionMask.begin(), buf.disocclusionMask.end(), 1.0f);
     }
 
@@ -110,7 +101,6 @@ void fsr2Dispatch(
     if (enabledPasses.count(FSR2_PASS_LOCK)) {
         fsr2PassLock(params.color, buf);
     } else {
-        // Neutral: no locks (maximum temporal freedom for all pixels)
         std::fill(buf.lockMask.begin(), buf.lockMask.end(), 0.0f);
     }
 
@@ -120,16 +110,25 @@ void fsr2Dispatch(
     bool useAccum = hasAccumPass || hasSharpenPass;
 
     if (useAccum) {
-        // Pass 3 = accumulate only. Pass 4 = accumulate with built-in sharpen.
-        // If only pass 4 is listed (not pass 3), use the sharpen variant.
+        // Pass 3 = accumulate only.
+        // Pass 4 = accumulate with built-in sharpening.
+        // If both are listed, pass 3 wins (hasAccumPass takes priority),
+        // built-in sharpening is suppressed, and RCAS (pass 5) handles
+        // sharpening instead.
         bool builtinSharpen = hasSharpenPass && !hasAccumPass && params.enableSharpening;
-        fsr2PassAccumulate(params.color, reactiveBuf, buf, params.sharpness, builtinSharpen);
+        fsr2PassAccumulate(params.color, reactiveBuf, buf,
+                           params.sharpness, builtinSharpen);
     }
 
     // ── Pass 5: RCAS ───────────────────────────────────────────────────────
-    bool runRCAS = enabledPasses.count(FSR2_PASS_RCAS) > 0 && params.sharpness > 0.0f;
-    if (runRCAS) {
-        // RCAS reads from internalColorHistory and writes back to it
+    //
+    // RCAS runs whenever pass 5 is in enabledPasses.
+    // We do NOT gate on params.sharpness > 0 here because sharpness=0.0
+    // means MAXIMUM sharpening (exp2(-0.0) = 1.0 multiplier), not "off".
+    // Whether RCAS runs at all is controlled exclusively by:
+    //   1. Pass 5 being in enabledPasses (set by --fsr2-rcas on/off in main.cpp)
+    //   2. The accumulate pass having produced output to sharpen
+    if (enabledPasses.count(FSR2_PASS_RCAS) && useAccum) {
         std::vector<float> rcasInput(buf.internalColorHistory);
         fsr2PassRCAS(rcasInput.data(), dW, dH,
                      buf.internalColorHistory.data(),
@@ -141,7 +140,7 @@ void fsr2Dispatch(
         std::memcpy(outDisplayColor, buf.internalColorHistory.data(),
                     dSize * 4 * sizeof(float));
     } else {
-        // No accumulate ran — bilinear upscale as passthrough
+        // No accumulate ran — bilinear passthrough
         float sx = (float)rW / (float)dW;
         float sy = (float)rH / (float)dH;
         for (int oy = 0; oy < dH; oy++) {
