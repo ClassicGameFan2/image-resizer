@@ -368,7 +368,15 @@ int main(int argc, char** argv) {
         // (fsr2Sharpness is the dedicated flag, but we respect --sharpness too if set)
     }
 
-    // When --onlyenablepasses excludes pass 5, disable fsr2 RCAS
+    // RCAS (pass 5) on/off is controlled exclusively via fsr2EnabledPasses.
+    // --fsr2-rcas off removes pass 5 from the set so fsr2Dispatch never runs it.
+    // --fsr2-rcas on keeps pass 5 in the set (default).
+    // This separation means sharpness=0.0 correctly means MAXIMUM sharpening,
+    // not "off". The sharpness value is only meaningful when pass 5 is enabled.
+    if (!fsr2Rcas) {
+        fsr2EnabledPasses.erase(FSR2_PASS_RCAS);
+    }
+    // If user specified --onlyenablepasses without pass 5, respect that too
     if (!fsr2EnabledPasses.count(FSR2_PASS_RCAS)) {
         fsr2Rcas = false;
     }
