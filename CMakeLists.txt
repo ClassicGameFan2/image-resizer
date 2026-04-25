@@ -23,6 +23,7 @@ add_executable(image-resizer
     src/fsr_rcas.cpp 
     src/scalers.cpp
     src/dither.cpp
+    src/odas.cpp                        # <-- NEW: ODAS algorithm
     # FSR 2.3.4 CPU Port
     src/fsr2_jitter_resample.cpp
     src/fsr2_pass_luminance.cpp
