@@ -12,6 +12,7 @@
 #include "stb_image_write.h"
 #include "dither.h"
 #include "fsr_math.h"
+#include "odas.h"
 
 namespace fs = std::filesystem;
 
@@ -49,16 +50,6 @@ extern void scaleFSR2(
     const std::set<int>& enabledPasses);
 
 // ── FSR2 RCAS applied to uint8 data ───────────────────────────────────────────
-//
-// Used for cross-RCAS cases (FSR2 RCAS on non-FSR2 upscale output, or
-// FSR2 RCAS as the post-step after FSR2 upscale when auto-tuner is active).
-//
-// Converts uint8→float, applies FSR2 RCAS in linear float space, optionally
-// applies LFGA/TEPD in the same float pass (correct order: RCAS then post-fx),
-// then converts back to uint8.
-//
-// lfga and tepd default to 0/false so this can also be used without post-fx
-// (e.g. during auto-tuner PSNR sweep where LFGA/TEPD must stay off).
 static void applyFSR2_RCAS_uint8(
     const unsigned char* input, int w, int h,
     unsigned char* output,
@@ -74,8 +65,6 @@ static void applyFSR2_RCAS_uint8(
 
     fsr2PassRCAS(floatBuf.data(), w, h, outFloat.data(), sharpness, denoise);
 
-    // Apply LFGA/TEPD in float space after RCAS — correct pipeline order.
-    // This branch is skipped during auto-tuner PSNR sweeps (lfga=0, tepd=false).
     if (lfga > 0.0f || tepd) {
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
@@ -110,26 +99,6 @@ double calculatePSNR(const unsigned char* img1, const unsigned char* img2,
 }
 
 // ── Auto-Tuner ────────────────────────────────────────────────────────────────
-//
-// Finds the RCAS sharpness level that maximizes PSNR for the given combination
-// of upscaling algorithm and RCAS type.
-//
-// Pipeline during PSNR sweep (sterile environment):
-//   1. Downscale original using downAlgo at downScale factor
-//   2. Upscale back to original size using upAlgo (NO RCAS, LFGA=0, TEPD=off)
-//   3. Evaluate base PSNR with no sharpening
-//   4. Sweep sharpness 0.0→2.0 in 0.1 steps using rcasType
-//      - sharpness=0.0 is MAXIMUM (exp2(-0.0)=1.0 multiplier)
-//      - sharpness=2.0 is MINIMUM (exp2(-2.0)=0.25 multiplier)
-//   5. Return the sharpness value that produced the highest PSNR
-//
-// rcasType:       "fsr1-rcas" or "fsr2-rcas" (already resolved, never "auto")
-// rcasDenoise:    FSR1 RCAS denoising flag  — honored when rcasType="fsr1-rcas"
-// fsr2RcasDenoise: FSR2 RCAS denoising flag — honored when rcasType="fsr2-rcas"
-// LFGA/TEPD:      always forced to false/off during PSNR sweep for accuracy
-//
-// FSR2-specific params (fsr2Depth, fsr2Jitter, etc.) are used when upAlgo="fsr2"
-// so the user's FSR2 settings are honored during the upscale reference step.
 void optimizeRCAS(
     const unsigned char* originalImg, int width, int height,
     const std::string& upAlgo,
@@ -152,13 +121,13 @@ void optimizeRCAS(
     unsigned char* downData = new unsigned char[(size_t)downW * downH * 4];
     unsigned char* upData   = new unsigned char[(size_t)width * height * 4];
 
-    // ── Step 1: Downscale ───────────────────────────────────────────────────
+    // Step 1: Downscale
     if      (downAlgo == "nearest")  scaleNearestNeighbor(originalImg, width, height, downData, downW, downH);
     else if (downAlgo == "bilinear") scaleBilinear(originalImg, width, height, downData, downW, downH, 0.0f, false);
     else if (downAlgo == "lanczos3") scaleLanczos3(originalImg, width, height, downData, downW, downH, 0.0f, false);
     else                             scaleBicubic (originalImg, width, height, downData, downW, downH, 0.0f, false);
 
-    // ── Step 2: Upscale (NO RCAS, LFGA=0, TEPD=off) ────────────────────────
+    // Step 2: Upscale (NO RCAS, LFGA=0, TEPD=off)
     if (upAlgo == "nearest") {
         scaleNearestNeighbor(downData, downW, downH, upData, width, height);
     } else if (upAlgo == "bilinear") {
@@ -170,19 +139,19 @@ void optimizeRCAS(
     } else if (upAlgo == "fsr") {
         scaleFSR_EASU(downData, downW, downH, upData, width, height, 0.0f, false);
     } else if (upAlgo == "fsr2") {
-        // Honor all FSR2 user settings for the upscale reference.
-        // Strip pass 5 (RCAS) so the upscaled base is sharpening-free.
-        // LFGA=0, TEPD=false for sterile PSNR environment.
         std::set<int> passesNoRcas = fsr2EnabledPasses;
         passesNoRcas.erase(FSR2_PASS_RCAS);
         scaleFSR2(downData, downW, downH, upData, width, height,
-                  0.0f, false, false,   // sharpness irrelevant, RCAS off
-                  0.0f, false,          // lfga=0, tepd=false
+                  0.0f, false, false,
+                  0.0f, false,
                   fsr2Depth, fsr2Jitter, fsr2Frames,
                   fsr2JitterMode, passesNoRcas);
     }
+    // Note: "odas" is intentionally excluded from auto-tuner upscale path.
+    // ODAS has its own internal Cuckoo Search optimizer and is not compatible
+    // with the external PSNR-sweep RCAS tuner. Use ODAS standalone.
 
-    // ── Step 3: Base PSNR (no sharpening) ──────────────────────────────────
+    // Step 3: Base PSNR (no sharpening)
     double bestPsnr  = calculatePSNR(originalImg, upData, width, height);
     outUseRcas       = false;
     outSharpness     = 0.0f;
@@ -190,9 +159,7 @@ void optimizeRCAS(
     std::cout << "  [Auto-Tuner] Base PSNR (RCAS off): "
               << std::fixed << std::setprecision(2) << bestPsnr << " dB" << std::endl;
 
-    // ── Step 4: Sweep sharpness 0.0 → 2.0 in 0.1 steps ─────────────────────
-    // LFGA/TEPD are always false here — they would distort PSNR.
-    // rcasDenoise / fsr2RcasDenoise are honored per the user's flag.
+    // Step 4: Sweep sharpness 0.0 → 2.0 in 0.1 steps
     unsigned char* rcasData = new unsigned char[(size_t)width * height * 4];
 
     for (int i = 0; i <= 20; ++i) {
@@ -201,12 +168,11 @@ void optimizeRCAS(
         if (rcasType == "fsr2-rcas") {
             applyFSR2_RCAS_uint8(upData, width, height, rcasData,
                                   testSharpness, fsr2RcasDenoise,
-                                  0.0f, false);   // lfga=0, tepd=false
+                                  0.0f, false);
         } else {
-            // "fsr1-rcas"
             applyFSR_RCAS(upData, width, height, rcasData,
                            testSharpness, rcasDenoise,
-                           0.0f, false);           // lfga=0, tepd=false
+                           0.0f, false);
         }
 
         double psnr = calculatePSNR(originalImg, rcasData, width, height);
@@ -217,7 +183,7 @@ void optimizeRCAS(
         }
     }
 
-    // ── Step 5: Report result ────────────────────────────────────────────────
+    // Step 5: Report result
     std::cout << "  [Auto-Tuner] Peak PSNR: "
               << std::fixed << std::setprecision(2) << bestPsnr << " dB  ->  ";
     if (outUseRcas) {
@@ -244,10 +210,6 @@ std::set<int> parsePassList(const std::string& s) {
 std::set<int> allPasses() { return {0,1,2,3,4,5,6,7,8}; }
 
 // ── Main image processor ──────────────────────────────────────────────────────
-//
-// resolvedPsnrRcasType: "fsr1-rcas" or "fsr2-rcas" — already resolved from
-//   "auto" in main(). Used by auto-tuner to know which RCAS to test, and
-//   then again in the final output step to apply the winning RCAS.
 bool processImage(
     const std::string& inFile, const std::string& outFile,
     float scale, const std::string& algo,
@@ -260,9 +222,10 @@ bool processImage(
     float fsr2Depth, bool fsr2Jitter, int fsr2Frames,
     Fsr2JitterMode fsr2JitterMode,
     const std::set<int>& fsr2EnabledPasses,
-    float fsr2Sharpness, bool fsr2Rcas, bool fsr2RcasDenoise)
+    float fsr2Sharpness, bool fsr2Rcas, bool fsr2RcasDenoise,
+    const OdasParams& odasParams)   // <-- NEW parameter, always last
 {
-    // ── Palette setup (unchanged) ─────────────────────────────────────────
+    // ── Palette setup ─────────────────────────────────────────────────────
     std::vector<ColorRGBA> targetPalette;
     bool hasTransparency = false;
     bool shouldMatch = false;
@@ -270,7 +233,8 @@ bool processImage(
     if (bpp == 8) {
         if (!matchPaletteFrom.empty()) {
             if (!loadOriginalPalette(matchPaletteFrom, targetPalette, hasTransparency)) {
-                std::cout << "Error: Could not load palette from " << matchPaletteFrom << std::endl;
+                std::cout << "Error: Could not load palette from "
+                          << matchPaletteFrom << std::endl;
                 return false;
             }
             shouldMatch = true;
@@ -278,7 +242,8 @@ bool processImage(
             bool is8Bit = loadOriginalPalette(inFile, targetPalette, hasTransparency);
             if (paletteMatch == "on") {
                 if (!is8Bit) {
-                    std::cout << "Error: --palette-match on requested, but input is not 8-bit." << std::endl;
+                    std::cout << "Error: --palette-match on requested, "
+                                 "but input is not 8-bit." << std::endl;
                     return false;
                 }
                 shouldMatch = true;
@@ -300,18 +265,27 @@ bool processImage(
         newH = std::max(1, (int)(height * scale));
     }
 
+    // ── Guard: ODAS cannot downscale ─────────────────────────────────────
+    if (algo == "odas" && (newW < width || newH < height)) {
+        std::cout << "Error: ODAS cannot downscale. Use scale >= 1.0." << std::endl;
+        stbi_image_free(imgData);
+        return false;
+    }
+
+    // ── Guard: auto-tuner is incompatible with ODAS ───────────────────────
+    // ODAS has its own internal Cuckoo Search optimizer. Running the external
+    // PSNR-sweep auto-tuner on top of it would be redundant and misleading.
+    if (algo == "odas" && runPsnrOpt) {
+        std::cout << "  [ODAS] Note: --rcas-max-psnr is ignored for --algo odas.\n"
+                  << "         ODAS optimizes λ internally via Cuckoo Search."
+                  << std::endl;
+    }
+
     // ── Auto-Tuner ────────────────────────────────────────────────────────
-    // When the auto-tuner runs it finds the PSNR-maximizing sharpness for
-    // resolvedPsnrRcasType. The results are stored in atUseRcas/atSharpness
-    // and used in the final output step further below.
-    //
-    // The auto-tuner always operates at the OUTPUT resolution (width x height)
-    // by downscaling then upscaling back. LFGA/TEPD are never applied during
-    // the sweep — they would add noise and distort PSNR comparisons.
     bool  atUseRcas   = false;
     float atSharpness = 0.0f;
 
-    if (runPsnrOpt && algo != "off") {
+    if (runPsnrOpt && algo != "off" && algo != "odas") {
         optimizeRCAS(imgData, width, height,
                      algo, psnrDownScale, psnrDownAlgo,
                      resolvedPsnrRcasType,
@@ -321,28 +295,59 @@ bool processImage(
                      atUseRcas, atSharpness);
     }
 
-    // ── Scaling and RCAS ──────────────────────────────────────────────────
-    //
-    // TWO PATHS:
-    //
-    // AUTO-TUNER PATH (runPsnrOpt == true):
-    //   Scale without any RCAS or LFGA/TEPD first. Then apply the winning
-    //   RCAS type with lfga/tepd so the final output matches exactly what
-    //   the auto-tuner measured (minus the lfga/tepd post-fx which do not
-    //   affect the PSNR-optimal sharpness decision).
-    //   This path supports cross-RCAS: fsr2 upscale + fsr1-rcas, or
-    //   fsr1/standard upscale + fsr2-rcas.
-    //
-    // NORMAL PATH (runPsnrOpt == false):
-    //   Original behavior unchanged.
-    //   FSR2: scaleFSR2 handles RCAS + LFGA/TEPD internally.
-    //   FSR1/standard: scale then optionally applyFSR_RCAS.
-
+    // ── Scaling ───────────────────────────────────────────────────────────
     unsigned char* finalData = nullptr;
 
-    if (runPsnrOpt) {
-        // ── Auto-tuner path ───────────────────────────────────────────────
+    if (algo == "odas") {
+        // ── ODAS path ─────────────────────────────────────────────────────
+        // ODAS is self-contained: Lanczos3 upscale + AES + ODAD + residual
+        // are all internal. LFGA/TEPD are applied here after ODAS output
+        // (same post-processing pattern as other scalers).
+        //
+        // RCAS is intentionally NOT applied after ODAS: the algorithm's
+        // residual sharpening step (F_RHR = F_IHR + F_RES) already provides
+        // equivalent edge enhancement. Stacking RCAS would over-sharpen.
+        //
+        // If the user explicitly passes --rcas on with --algo odas, we warn
+        // but still skip RCAS (ODAS + RCAS = over-sharpened output).
 
+        if (useRcas) {
+            std::cout << "  [ODAS] Warning: --rcas on is ignored for --algo odas.\n"
+                      << "         ODAS performs its own residual-based sharpening."
+                      << std::endl;
+        }
+
+        finalData = new unsigned char[(size_t)newW * newH * 4];
+        scaleODAS(imgData, width, height, finalData, newW, newH, odasParams);
+
+        // Apply LFGA/TEPD after ODAS if requested
+        if (lfga > 0.0f || tepd) {
+            size_t pixels = (size_t)newW * newH;
+            std::vector<float> floatBuf(pixels * 4);
+            for (size_t i = 0; i < pixels * 4; i++)
+                floatBuf[i] = finalData[i] / 255.0f;
+
+            for (int y = 0; y < newH; y++) {
+                for (int x = 0; x < newW; x++) {
+                    size_t idx = ((size_t)y * newW + x) * 4;
+                    float3 color(floatBuf[idx], floatBuf[idx+1], floatBuf[idx+2]);
+                    color = applyPostProcess(color, x, y, lfga, tepd);
+                    floatBuf[idx+0] = color.x;
+                    floatBuf[idx+1] = color.y;
+                    floatBuf[idx+2] = color.z;
+                }
+            }
+
+            unsigned char* ppOut = new unsigned char[pixels * 4];
+            for (size_t i = 0; i < pixels * 4; i++)
+                ppOut[i] = (unsigned char)(
+                    clamp(floatBuf[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+            delete[] finalData;
+            finalData = ppOut;
+        }
+
+    } else if (runPsnrOpt) {
+        // ── Auto-tuner path ───────────────────────────────────────────────
         finalData = new unsigned char[(size_t)newW * newH * 4];
 
         // Scale without RCAS and without LFGA/TEPD
@@ -351,12 +356,11 @@ bool processImage(
                 std::cout << "Error: FSR2 cannot downscale." << std::endl;
                 stbi_image_free(imgData); delete[] finalData; return false;
             }
-            // Strip pass 5 so scaleFSR2 does not apply RCAS internally
             std::set<int> passesNoRcas = fsr2EnabledPasses;
             passesNoRcas.erase(FSR2_PASS_RCAS);
             scaleFSR2(imgData, width, height, finalData, newW, newH,
-                      0.0f, false, false,  // no RCAS
-                      0.0f, false,          // lfga=0, tepd=false
+                      0.0f, false, false,
+                      0.0f, false,
                       fsr2Depth, fsr2Jitter, fsr2Frames,
                       fsr2JitterMode, passesNoRcas);
         } else if (algo == "off") {
@@ -382,14 +386,10 @@ bool processImage(
             unsigned char* rcasOut = new unsigned char[(size_t)newW * newH * 4];
 
             if (resolvedPsnrRcasType == "fsr2-rcas") {
-                // FSR2 RCAS — operates in float space via helper.
-                // LFGA/TEPD applied inside helper after RCAS (correct order).
                 applyFSR2_RCAS_uint8(finalData, newW, newH, rcasOut,
                                       atSharpness, fsr2RcasDenoise,
                                       lfga, tepd);
             } else {
-                // FSR1 RCAS — LFGA/TEPD applied inside applyFSR_RCAS.
-                // rcasDenoise honored as the user specified.
                 applyFSR_RCAS(finalData, newW, newH, rcasOut,
                                atSharpness, rcasDenoise,
                                lfga, tepd);
@@ -397,10 +397,8 @@ bool processImage(
 
             delete[] finalData;
             finalData = rcasOut;
-
         } else {
-            // Auto-tuner found RCAS OFF is optimal.
-            // Still apply LFGA/TEPD if the user requested them.
+            // RCAS OFF — still apply LFGA/TEPD if requested
             if (lfga > 0.0f || tepd) {
                 size_t pixels = (size_t)newW * newH;
                 std::vector<float> floatBuf(pixels * 4);
@@ -418,7 +416,8 @@ bool processImage(
                 }
                 unsigned char* ppOut = new unsigned char[pixels * 4];
                 for (size_t i = 0; i < pixels * 4; i++)
-                    ppOut[i] = (unsigned char)(clamp(floatBuf[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+                    ppOut[i] = (unsigned char)(
+                        clamp(floatBuf[i], 0.0f, 1.0f) * 255.0f + 0.5f);
                 delete[] finalData;
                 finalData = ppOut;
             }
@@ -429,11 +428,11 @@ bool processImage(
 
         if (algo == "fsr2") {
             if (scale < 1.0f) {
-                std::cout << "Error: FSR2 cannot downscale. Use scale >= 1.0." << std::endl;
+                std::cout << "Error: FSR2 cannot downscale. Use scale >= 1.0."
+                          << std::endl;
                 stbi_image_free(imgData); return false;
             }
             finalData = new unsigned char[(size_t)newW * newH * 4];
-            // scaleFSR2 handles RCAS (pass 5) + LFGA/TEPD internally
             scaleFSR2(imgData, width, height, finalData, newW, newH,
                       fsr2Sharpness, fsr2Rcas, fsr2RcasDenoise,
                       lfga, tepd,
@@ -442,7 +441,6 @@ bool processImage(
         } else {
             // FSR1/standard path
             unsigned char* step1Data = new unsigned char[(size_t)newW * newH * 4];
-            // If RCAS will run, hold LFGA/TEPD back so they apply in the RCAS step
             float pass1_lfga = useRcas ? 0.0f : lfga;
             bool  pass1_tepd = useRcas ? false : tepd;
 
@@ -453,10 +451,12 @@ bool processImage(
             else if (algo == "lanczos3") scaleLanczos3(imgData, width, height, step1Data, newW, newH, pass1_lfga, pass1_tepd);
             else if (algo == "fsr") {
                 if (scale < 1.0f) {
-                    std::cout << "Error: FSR mathematically cannot downscale." << std::endl;
+                    std::cout << "Error: FSR mathematically cannot downscale."
+                              << std::endl;
                     stbi_image_free(imgData); delete[] step1Data; return false;
                 }
-                scaleFSR_EASU(imgData, width, height, step1Data, newW, newH, pass1_lfga, pass1_tepd);
+                scaleFSR_EASU(imgData, width, height, step1Data, newW, newH,
+                               pass1_lfga, pass1_tepd);
             }
 
             finalData = step1Data;
@@ -518,9 +518,6 @@ int main(int argc, char** argv) {
     bool runPsnrOpt = false;
     float psnrDownScale = 0.5f;
     std::string psnrDownAlgo = "bicubic";
-    // "auto" is resolved after all args are parsed:
-    //   fsr2 algo  → "fsr2-rcas"
-    //   other algo → "fsr1-rcas"
     std::string psnrRcasType = "auto";
 
     // ── FSR2 options ───────────────────────────────────────────────────────
@@ -532,6 +529,11 @@ int main(int argc, char** argv) {
     float fsr2Sharpness = 0.2f;
     bool fsr2Rcas = true;
     bool fsr2RcasDenoise = false;
+
+    // ── ODAS options ───────────────────────────────────────────────────────
+    // All fields initialized to paper-recommended defaults (OdasParams{}).
+    // Individual fields are overridden by --odas-* CLI flags below.
+    OdasParams odasParams;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -546,28 +548,19 @@ int main(int argc, char** argv) {
         else if (arg == "--lfga"      && i+1<argc) lfga      = std::stof(argv[++i]);
         else if (arg == "--tepd"      && i+1<argc) tepd      = (std::string(argv[++i]) == "on");
         else if (arg == "--bpp"       && i+1<argc) bpp       = std::stoi(argv[++i]);
-        else if (arg == "--palette-match"       && i+1<argc) paletteMatch    = argv[++i];
+        else if (arg == "--palette-match"       && i+1<argc) paletteMatch     = argv[++i];
         else if (arg == "--match-palette-from"  && i+1<argc) matchPaletteFrom = argv[++i];
-        else if (arg == "--palette-dither"      && i+1<argc) paletteDither   = argv[++i];
+        else if (arg == "--palette-dither"      && i+1<argc) paletteDither    = argv[++i];
 
         // ── Auto-Tuner ────────────────────────────────────────────────────
-        // Syntax: --rcas-max-psnr [value]
-        // value can be any of:
-        //   fsr1-rcas                    → just set RCAS type
-        //   fsr2-rcas                    → just set RCAS type
-        //   0.5,bicubic                  → set downscale factor and algo
-        //   0.5,bicubic,fsr1-rcas        → set all three
-        //   0.5,bicubic,fsr2-rcas        → set all three
         else if (arg == "--rcas-max-psnr") {
             runPsnrOpt = true;
             if (i + 1 < argc) {
                 std::string nextArg = argv[i+1];
                 if (nextArg.find("--") != 0) {
                     if (nextArg == "fsr1-rcas" || nextArg == "fsr2-rcas") {
-                        // Just a RCAS type, no scale/algo override
                         psnrRcasType = nextArg;
                     } else {
-                        // downscale,algo[,rcastype]
                         size_t comma1 = nextArg.find(',');
                         if (comma1 != std::string::npos) {
                             try {
@@ -585,7 +578,7 @@ int main(int argc, char** argv) {
                             } catch(...) {}
                         }
                     }
-                    i++; // consume the argument
+                    i++;
                 }
             }
         }
@@ -605,6 +598,24 @@ int main(int argc, char** argv) {
         else if (arg == "--fsr2-rcas-denoise" && i+1<argc) fsr2RcasDenoise  = (std::string(argv[++i]) == "on");
         else if (arg == "--onlyenablepasses"  && i+1<argc) fsr2EnabledPasses = parsePassList(argv[++i]);
 
+        // ── ODAS options ──────────────────────────────────────────────────
+        // All flags follow --odas-<parameter> <value> convention.
+        // Defaults match paper recommendations (see odas.h OdasParams).
+        else if (arg == "--odas-k"           && i+1<argc)
+            odasParams.K               = std::stof(argv[++i]);
+        else if (arg == "--odas-canny-low"   && i+1<argc)
+            odasParams.cannyLowThresh  = std::stof(argv[++i]);
+        else if (arg == "--odas-canny-high"  && i+1<argc)
+            odasParams.cannyHighThresh = std::stof(argv[++i]);
+        else if (arg == "--odas-cs-nests"    && i+1<argc)
+            odasParams.csNests         = std::stoi(argv[++i]);
+        else if (arg == "--odas-cs-iter"     && i+1<argc)
+            odasParams.csMaxIter       = std::stoi(argv[++i]);
+        else if (arg == "--odas-rgb")
+            // Switch from YCbCr to per-channel RGB processing.
+            // YCbCr is default and preferred (avoids chroma halos).
+            odasParams.useYCbCr        = false;
+
         else if (inputPath.empty())  inputPath  = arg;
         else if (outputPath.empty()) outputPath = arg;
     }
@@ -619,6 +630,28 @@ int main(int argc, char** argv) {
         std::cout << "  --bpp 32|24|8  --suffix _hd\n";
         std::cout << "  --palette-match auto|on|off  --match-palette-from <file>\n";
         std::cout << "  --palette-dither fs|none\n\n";
+        std::cout << "=== ODAS (--algo odas) ===\n";
+        std::cout << "  Optimized Directional Anisotropic Sharpening\n";
+        std::cout << "  Panda & Meher, Engineering Applications of AI, 2024\n";
+        std::cout << "  --odas-k 0.20              Edge-strength threshold (default 0.20)\n";
+        std::cout << "                             Lower = sharper edges preserved\n";
+        std::cout << "  --odas-canny-low 50        Canny low threshold, 0-255 (default 50)\n";
+        std::cout << "  --odas-canny-high 150      Canny high threshold, 0-255 (default 150)\n";
+        std::cout << "                             Ratio ~1:3 recommended\n";
+        std::cout << "  --odas-cs-nests 25         Cuckoo Search population (default 25)\n";
+        std::cout << "  --odas-cs-iter 100         Cuckoo Search iterations (default 100)\n";
+        std::cout << "  --odas-rgb                 Process RGB channels independently\n";
+        std::cout << "                             (default: YCbCr - avoids chroma halos)\n";
+        std::cout << "  Notes:\n";
+        std::cout << "    - ODAS cannot downscale (scale must be >= 1.0)\n";
+        std::cout << "    - --rcas is ignored (ODAS has residual sharpening)\n";
+        std::cout << "    - --rcas-max-psnr is ignored (ODAS uses Cuckoo Search)\n";
+        std::cout << "    - --lfga and --tepd are applied after ODAS\n\n";
+        std::cout << "  Quality presets:\n";
+        std::cout << "    Fast:    --odas-cs-nests 10 --odas-cs-iter 20\n";
+        std::cout << "    Default: --odas-cs-nests 25 --odas-cs-iter 100\n";
+        std::cout << "    Quality: --odas-cs-nests 50 --odas-cs-iter 200\n";
+        std::cout << "             --odas-canny-low 30 --odas-canny-high 90 --odas-k 0.15\n\n";
         std::cout << "=== FSR 2.3.4 (--algo fsr2) ===\n";
         std::cout << "  --fsr2-jitter on|off            (default on)\n";
         std::cout << "  --fsr2-frames 32                (default 32)\n";
@@ -641,8 +674,8 @@ int main(int argc, char** argv) {
         std::cout << "      0.5,bicubic,fsr2-rcas       all three options\n";
         std::cout << "    Default RCAS type: fsr1-rcas for non-FSR2 algos,\n";
         std::cout << "                       fsr2-rcas for --algo fsr2\n";
+        std::cout << "    Not available with --algo odas (use --odas-cs-iter instead)\n";
         std::cout << "    LFGA/TEPD are always disabled during PSNR sweep.\n";
-        std::cout << "    rcas-denoise / fsr2-rcas-denoise flags are honored.\n";
         return 1;
     }
 
@@ -651,8 +684,7 @@ int main(int argc, char** argv) {
     // FSR1 RCAS on/off
     bool useRcas = (rcasInput == "on" || (rcasInput == "auto" && algo == "fsr"));
 
-    // FSR2 RCAS on/off: controlled exclusively via enabledPasses (pass 5).
-    // sharpness=0.0 means maximum sharpening, not off.
+    // FSR2 RCAS on/off
     if (!fsr2Rcas) {
         fsr2EnabledPasses.erase(FSR2_PASS_RCAS);
     }
@@ -660,8 +692,7 @@ int main(int argc, char** argv) {
         fsr2Rcas = false;
     }
 
-    // Resolve "auto" psnrRcasType based on the upscaling algorithm.
-    // This must happen after --algo is fully parsed.
+    // Resolve "auto" psnrRcasType
     std::string resolvedPsnrRcasType = psnrRcasType;
     if (resolvedPsnrRcasType == "auto") {
         resolvedPsnrRcasType = (algo == "fsr2") ? "fsr2-rcas" : "fsr1-rcas";
@@ -678,7 +709,8 @@ int main(int argc, char** argv) {
             resolvedPsnrRcasType,
             fsr2Depth, fsr2Jitter, fsr2Frames,
             fsr2JitterMode, fsr2EnabledPasses,
-            fsr2Sharpness, fsr2Rcas, fsr2RcasDenoise);
+            fsr2Sharpness, fsr2Rcas, fsr2RcasDenoise,
+            odasParams);  // <-- NEW
     };
 
     if (fs::is_directory(inputPath)) {
@@ -688,7 +720,8 @@ int main(int argc, char** argv) {
                 entry.path().extension().string() == ".png") {
                 std::string outFilePath = (fs::path(outputPath) /
                     (entry.path().stem().string() + suffix + ".png")).string();
-                std::cout << " -> " << entry.path().filename().string() << std::endl;
+                std::cout << " -> " << entry.path().filename().string()
+                          << std::endl;
                 processOne(entry.path().string(), outFilePath);
             }
         }
