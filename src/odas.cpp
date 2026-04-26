@@ -1,27 +1,29 @@
 // =============================================================================
-// odas.cpp — v7: Faithful implementation matching Panda & Meher 2024
+// odas.cpp — v8: Correct boundary conditions for AES and ODAD
+//
+// KEY FIXES vs v7:
+//   1. AES: convolve H with F_hat neighborhood (not zeroed F_E sparse image).
+//      F_E pixel values at edge locations, reading full F_hat for neighbors.
+//      This prevents the 182 grey level explosion.
+//
+//   2. ODAD: smooth pixels read F_hat at edge neighbor locations (fixed
+//      boundary condition), not zero. This prevents artificial gradients
+//      that darken/blur regions adjacent to edges.
+//
+//   3. F_E and F_s are now only used as MASKS to know which pixels are
+//      edge vs smooth. The actual pixel VALUES always come from F_hat
+//      (or FOTP for smooth-to-smooth neighbors in ODAD).
 //
 // PIPELINE (matches paper Section 4 exactly):
-//   F_hat  = Lanczos3_Upscale(F_LR)                     [Eq. 3]
-//   F_E    = EdgeDetect(F_hat)       -- actual pixel values at edges
-//   F_s    = F_hat - F_E             -- smooth region    [Eq. 7]
-//   F_AES  = Convolve(H_adaptive, F_E)                   [Eq. 5, Alg 1]
-//   F_OTP  = ODAD(F_s, lambda, K)    -- 1 iteration      [Eq. 8-11]
-//   F_IHR  = F_AES + F_OTP          -- additive          [Eq. 12]
-//   F_BHR  = L3dn(L3up(F_IHR))      -- blur reference    
-//   F_RES  = F_IHR - F_BHR                               [Eq. 13]
-//   F_RHR  = F_IHR + F_RES = 2*F_IHR - F_BHR            [Eq. 14]
-//
-// KEY FIXES vs v6:
-//   1. F_E contains ACTUAL pixel values (not a mask). F_s = Fhat - F_E.
-//   2. AES: convolve H with F_E directly (not unsharp mask on Fhat).
-//   3. IHR: F_AES + F_OTP (additive, not selector).
-//   4. ODAD: smooth region only (F_s), edge pixels are fixed boundaries.
-//   5. CS fitness: SSIM of (F_OTP vs F_s) — maximize structural similarity.
-//      λ=0 gives SSIM=1.0 trivially, so we maximize SSIM while requiring
-//      λ > 0 (we want the largest λ that keeps SSIM high).
-//      Correct formulation: maximize λ subject to SSIM(F_OTP, F_s) > threshold.
-//   6. Levy flight: proper step without decay collapse.
+//   F_hat  = Lanczos3_Upscale(F_LR)
+//   edgeMask = Canny(F_hat)          -- boolean mask
+//   F_AES[edge]  = Convolve(H, F_hat) at edge locations   [Eq. 5, Alg 1]
+//   F_AES[smooth]= 0
+//   F_OTP[smooth]= ODAD(F_hat_smooth, boundary=F_hat_edge) [Eq. 8-11]
+//   F_OTP[edge]  = 0
+//   F_IHR = F_AES + F_OTP            [Eq. 12]
+//   F_BHR = L3dn(L3up(F_IHR))
+//   F_RHR = 2*F_IHR - F_BHR         [Eqs. 13-14]
 // =============================================================================
 #include "odas.h"
 #include "fsr_math.h"
@@ -53,19 +55,17 @@ static inline float getPixelF(const std::vector<float>& img,
 }
 
 // =============================================================================
-// LANCZOS3 UPSCALE / DOWNSCALE
+// LANCZOS3
 // =============================================================================
 static float sincF(float x) {
     if (std::abs(x) < 1e-7f) return 1.0f;
     float px = kPi * x;
     return std::sin(px) / px;
 }
-
 static float L3w(float p) {
     float a = std::abs(p);
     return (a < 3.0f) ? sincF(a) * sincF(a / 3.0f) : 0.0f;
 }
-
 static void L3up(const std::vector<float>& src, int iw, int ih,
     std::vector<float>& dst, int ow, int oh)
 {
@@ -91,7 +91,6 @@ static void L3up(const std::vector<float>& src, int iw, int ih,
         }
     }
 }
-
 static void L3dn(const std::vector<float>& src, int iw, int ih,
     std::vector<float>& dst, int ow, int oh)
 {
@@ -124,15 +123,12 @@ static void L3dn(const std::vector<float>& src, int iw, int ih,
 }
 
 // =============================================================================
-// CANNY EDGE DETECTION
-// Returns: edgeMask (bool), F_E (actual pixel values at edge locations),
-//          F_s (Fhat minus edge pixels = smooth region)
-// Paper Eq. 7: F_s = F_hat - F_E
+// CANNY — returns boolean edge mask only
+// F_hat values are used directly; we just need to know WHICH pixels are edges.
 // =============================================================================
 static void gblur5(const std::vector<float>& src, int w, int h,
     std::vector<float>& dst)
 {
-    // 5x5 Gaussian kernel (sum=273)
     static const float K[5][5] = {
         {1,4,7,4,1},{4,16,26,16,4},{7,26,41,26,7},{4,16,26,16,4},{1,4,7,4,1}
     };
@@ -147,13 +143,9 @@ static void gblur5(const std::vector<float>& src, int w, int h,
         }
 }
 
-// Builds edgeMask, F_E (pixel values at edges, 0 elsewhere),
-// and F_s (pixel values at smooth pixels, 0 at edges).
-static void cannyAndSplit(const std::vector<float>& Fhat,
+static void cannyEdgeMask(const std::vector<float>& Fhat,
     int w, int h,
-    std::vector<bool>&  edgeMask,  // true = edge pixel
-    std::vector<float>& FE,        // F_E: actual values at edges
-    std::vector<float>& Fs,        // F_s: actual values at smooth pixels
+    std::vector<bool>& edgeMask,
     float lo, float hi)
 {
     int N = w * h;
@@ -176,7 +168,6 @@ static void cannyAndSplit(const std::vector<float>& Fhat,
             gd[i] = std::atan2(gy, gx);
         }
 
-    // Non-maximum suppression
     std::vector<float> sup(N, 0);
     for (int y = 1; y < h-1; ++y)
         for (int x = 1; x < w-1; ++x) {
@@ -192,7 +183,6 @@ static void cannyAndSplit(const std::vector<float>& Fhat,
             sup[i] = (m >= m1 && m >= m2) ? m : 0;
         }
 
-    // Hysteresis thresholding
     std::vector<int> st(N, 0);
     for (int i = 0; i < N; ++i) {
         if      (sup[i] >= hi) st[i] = 2;
@@ -215,47 +205,34 @@ static void cannyAndSplit(const std::vector<float>& Fhat,
             }
     }
 
-    // Build edgeMask, F_E, F_s
-    // Paper Eq. 7: F_s = F_hat - F_E
-    // F_E[i] = Fhat[i] if edge, else 0
-    // F_s[i] = 0 if edge, else Fhat[i]  (= Fhat - F_E)
     edgeMask.assign(N, false);
-    FE.assign(N, 0.0f);
-    Fs.assign(N, 0.0f);
-    for (int i = 0; i < N; ++i) {
-        if (st[i] == 2) {
-            edgeMask[i] = true;
-            FE[i] = Fhat[i];   // edge: F_E gets the pixel value
-            Fs[i] = 0.0f;      // smooth: 0 at edge locations
-        } else {
-            edgeMask[i] = false;
-            FE[i] = 0.0f;      // edge: 0 at smooth locations
-            Fs[i] = Fhat[i];   // smooth: gets the pixel value
-        }
-    }
+    for (int i = 0; i < N; ++i)
+        edgeMask[i] = (st[i] == 2);
 }
 
 // =============================================================================
-// AES — Adaptive Edge Sharpening (Algorithm 1, paper Section 4.2)
+// AES — Adaptive Edge Sharpening (Algorithm 1, Section 4.2)
 //
-// Convolves F_E with adaptive 3x3 Laplacian kernel H.
-// H has center = cmp, neighbors = -cmp/8 (sum = 0).
-// cmp is chosen based on local variance of F_E in 5 levels: {16,24,32,40,48}
+// For each edge pixel (m,n):
+//   1. Compute local variance in 3x3 neighborhood of F_hat (not zeroed F_E)
+//   2. Select cmp from {16,24,32,40,48} based on variance level
+//   3. Build H kernel: center=cmp, neighbors=-cmp/8
+//   4. Convolve H with F_hat neighborhood → F_AES(m,n)
 //
-// F_AES(m,n) = sum_{k=-1}^{1} sum_{l=-1}^{1} H(k,l) * F_E(m+k, n+l)
+// CRITICAL: Convolution reads from F_hat (full image), NOT from a sparse
+// zeroed mask. This prevents the 182 grey level explosion.
 //
-// Note: F_E has actual pixel values at edge locations, 0 elsewhere.
-// The convolution produces the sharpened edge image.
+// F_AES is non-zero only at edge pixel locations.
 // =============================================================================
-static void applyAES(const std::vector<float>& FE,
+static void applyAES(const std::vector<float>& Fhat,
     const std::vector<bool>& edgeMask,
     int w, int h,
     std::vector<float>& FAES)
 {
     size_t N = (size_t)w * h;
-    FAES.resize(N, 0.0f);
+    FAES.assign(N, 0.0f);
 
-    // Step 1: Compute local variance for all edge pixels (3x3 window of F_E)
+    // Step 1: Compute local variance for all edge pixels using F_hat
     std::vector<float> lv(N, 0.0f);
     float VRmin = 1e30f, VRmax = -1e30f;
 
@@ -264,18 +241,18 @@ static void applyAES(const std::vector<float>& FE,
             size_t i = (size_t)y*w + x;
             if (!edgeMask[i]) continue;
 
-            // Local mean over 3x3 of F_E
+            // Local mean from F_hat
             float s = 0;
             for (int ky = -1; ky <= 1; ++ky)
                 for (int kx = -1; kx <= 1; ++kx)
-                    s += getPixelF(FE, w, h, x+kx, y+ky);
+                    s += getPixelF(Fhat, w, h, x+kx, y+ky);
             float lm = s / 9.0f;
 
-            // Local variance
+            // Local variance from F_hat
             float v = 0;
             for (int ky = -1; ky <= 1; ++ky)
                 for (int kx = -1; kx <= 1; ++kx) {
-                    float d = getPixelF(FE, w, h, x+kx, y+ky) - lm;
+                    float d = getPixelF(Fhat, w, h, x+kx, y+ky) - lm;
                     v += d * d;
                 }
             lv[i] = v / 9.0f;
@@ -284,83 +261,101 @@ static void applyAES(const std::vector<float>& FE,
         }
 
     if (VRmin > VRmax) {
-        // No edge pixels — F_AES = F_E (pass through)
-        FAES = FE;
+        // No edge pixels
+        FAES.assign(N, 0.0f);
         return;
     }
 
     float S = (VRmax - VRmin) / 4.0f;
     if (S < 1e-6f) S = 1.0f;
 
-    // Step 2: For each edge pixel, build H and convolve with F_E
+    // Step 2: Convolve H with F_hat at each edge pixel location
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
             size_t i = (size_t)y*w + x;
             if (!edgeMask[i]) {
-                FAES[i] = 0.0f;  // non-edge locations: 0 in F_AES
+                FAES[i] = 0.0f;  // non-edge: zero contribution
                 continue;
             }
 
-            // Select cmp based on variance level (Algorithm 1)
+            // Select cmp from Algorithm 1
             float lvr = lv[i];
             float cmp;
-            if      (lvr > VRmin       && lvr <= VRmin + S)   cmp = 16.0f;
-            else if (lvr > VRmin + S   && lvr <= VRmin + 2*S) cmp = 24.0f;
+            if      (lvr > VRmin       && lvr <= VRmin +   S) cmp = 16.0f;
+            else if (lvr > VRmin +   S && lvr <= VRmin + 2*S) cmp = 24.0f;
             else if (lvr > VRmin + 2*S && lvr <= VRmin + 3*S) cmp = 32.0f;
             else if (lvr > VRmin + 3*S && lvr <= VRmin + 4*S) cmp = 40.0f;
             else                                                cmp = 48.0f;
 
-            // Build H kernel (sum = 0):
-            // center = cmp, all 8 neighbors = -cmp/8
-            // Apply convolution: F_AES(m,n) = sum H(k,l)*F_E(m+k, n+l)
+            // Convolve H (center=cmp, neighbors=-cmp/8) with F_hat neighborhood
+            // H sums to zero: cmp + 8*(-cmp/8) = 0
             float sum = 0.0f;
             for (int ky = -1; ky <= 1; ++ky)
                 for (int kx = -1; kx <= 1; ++kx) {
                     float hval = (ky == 0 && kx == 0) ? cmp : (-cmp / 8.0f);
-                    sum += hval * getPixelF(FE, w, h, x+kx, y+ky);
+                    sum += hval * getPixelF(Fhat, w, h, x+kx, y+ky);
                 }
 
-            FAES[i] = std::max(0.0f, std::min(255.0f, sum));
+            // sum is the Laplacian response — this IS the sharpened edge value
+            // The paper's F_AES is the convolution output, which represents
+            // the high-frequency edge detail extracted from F_hat.
+            // We need to ADD it back to the edge pixel to get the sharpened value:
+            // F_AES_final = F_hat[edge] + sum  (unsharp mask interpretation)
+            // BUT: the paper says F_IHR = F_AES + F_OTP and F_OTP covers smooth
+            // pixels (=0 at edge locations). So F_AES must contain the full
+            // sharpened pixel value at edge locations, not just the delta.
+            //
+            // Correct interpretation: F_AES = F_hat + Laplacian_response
+            // where Laplacian_response = convolution of H with F_hat
+            // H has center=cmp and neighbors=-cmp/8, so:
+            // response = cmp*(center - avg_neighbors) = cmp * local_laplacian
+            // F_AES = F_hat[edge] + response   (sharpened edge pixel)
+            FAES[i] = std::max(0.0f, std::min(255.0f,
+                Fhat[i] + sum));
         }
 }
 
 // =============================================================================
 // ODAD — Optimized Directional Anisotropic Diffusion (Section 4.3)
 //
-// Operates on F_s (smooth region, edge pixels = 0/boundary).
-// One iteration (t=1) per paper Section 4.3 and Figure 4.
+// Operates on smooth region pixels. Edge pixels are FIXED BOUNDARIES
+// and use F_hat values (not zero) when read by smooth pixel neighbors.
 //
-// [F_OTP]^{t+1}_{m,n} = [F_s]^t_{m,n} + lambda * sum(d_dir * grad_dir)
+// This is the critical fix: when a smooth pixel reads a neighbor that
+// is an edge pixel, it reads F_hat[neighbor], not 0.
+// This prevents large artificial gradients at edge/smooth boundaries.
 //
-// d_dir = exp(-(|grad_dir|/K)^2)   [Eq. 11]
-// grad_dir = neighbor - center      [Eq. 9]
-//
-// Edge pixels (edgeMask=true) are treated as fixed boundary conditions:
-// their values are read but never updated.
+// We maintain two arrays:
+//   - FOTP: current state (initialized to F_hat for ALL pixels)
+//   - Only smooth pixels are updated each iteration
+//   - Edge pixels stay fixed at F_hat values throughout
 // =============================================================================
-static void applyODAD(const std::vector<float>& Fs,
+static void applyODAD(const std::vector<float>& Fhat,
     const std::vector<bool>& edgeMask,
     int w, int h,
     std::vector<float>& FOTP,
     float lambda, float K, int iters)
 {
     const float K2 = K * K;
-    // Start from F_s (smooth region image)
-    FOTP = Fs;
+
+    // Initialize FOTP to F_hat for ALL pixels (both edge and smooth).
+    // Edge pixels remain at F_hat throughout (fixed boundary).
+    // Smooth pixels will be updated by diffusion.
+    FOTP = Fhat;
 
     for (int t = 0; t < iters; ++t) {
         std::vector<float> next = FOTP;
         for (int m = 0; m < h; ++m)
             for (int n = 0; n < w; ++n) {
                 size_t i = (size_t)m*w + n;
-                // Edge pixels are fixed boundaries — not updated
+                // Edge pixels: fixed boundary, not updated
                 if (edgeMask[i]) continue;
 
                 float c = FOTP[i];
 
-                // 8 directional gradients (Eq. 9)
-                // Note: edge pixels (value=0 in Fs) act as zero-value boundaries
-                // We use the FOTP values which start as Fs
+                // Read neighbors from FOTP (which has F_hat at edge pixels,
+                // updated smooth values at smooth pixels). This ensures
+                // edge pixels act as proper fixed boundaries.
                 float gN  = getPixelF(FOTP, w, h, n,   m-1) - c;
                 float gS  = getPixelF(FOTP, w, h, n,   m+1) - c;
                 float gE  = getPixelF(FOTP, w, h, n+1, m  ) - c;
@@ -370,7 +365,7 @@ static void applyODAD(const std::vector<float>& Fs,
                 float gWS = getPixelF(FOTP, w, h, n-1, m+1) - c;
                 float gWN = getPixelF(FOTP, w, h, n-1, m-1) - c;
 
-                // Diffusion coefficients (Eq. 10, 11)
+                // Diffusion coefficients (Eq. 11)
                 auto dc = [&](float g) {
                     return std::exp(-(g*g) / K2);
                 };
@@ -384,21 +379,22 @@ static void applyODAD(const std::vector<float>& Fs,
             }
         FOTP = next;
     }
+    // After ODAD: edge pixels in FOTP = F_hat values (unchanged)
+    // For IHR composition we need F_OTP to have 0 at edge locations
+    // (since F_AES covers edges, F_OTP covers smooth).
+    // Zero out edge pixels in FOTP so F_IHR = F_AES + F_OTP works correctly.
+    for (size_t i = 0; i < (size_t)w*h; ++i)
+        if (edgeMask[i]) FOTP[i] = 0.0f;
 }
 
 // =============================================================================
-// SSIM helper for CS fitness function
-// Computed on smooth region pixels only (where edgeMask = false).
-// SSIM(F_OTP, F_s) measures how well ODAD preserves the smooth region's
-// structural content. λ=0 gives SSIM=1.0 (no change), larger λ may
-// improve or degrade it. We find largest λ with SSIM above threshold.
+// SSIM for CS fitness (smooth region only)
 // =============================================================================
 static float computeSSIM(const std::vector<float>& img1,
     const std::vector<float>& img2,
     const std::vector<bool>& edgeMask,
     int w, int h)
 {
-    // Collect smooth-region pixel pairs
     double mu1 = 0, mu2 = 0;
     int cnt = 0;
     for (size_t i = 0; i < (size_t)w*h; ++i) {
@@ -408,69 +404,51 @@ static float computeSSIM(const std::vector<float>& img1,
         ++cnt;
     }
     if (cnt == 0) return 1.0f;
-    mu1 /= cnt;
-    mu2 /= cnt;
+    mu1 /= cnt; mu2 /= cnt;
 
     double sig1sq = 0, sig2sq = 0, sig12 = 0;
     for (size_t i = 0; i < (size_t)w*h; ++i) {
         if (edgeMask[i]) continue;
         double d1 = img1[i] - mu1;
         double d2 = img2[i] - mu2;
-        sig1sq += d1 * d1;
-        sig2sq += d2 * d2;
-        sig12  += d1 * d2;
+        sig1sq += d1*d1;
+        sig2sq += d2*d2;
+        sig12  += d1*d2;
     }
-    sig1sq /= cnt;
-    sig2sq /= cnt;
-    sig12  /= cnt;
+    sig1sq /= cnt; sig2sq /= cnt; sig12 /= cnt;
 
-    // SSIM constants (L=255 for [0,255] range)
-    const double C1 = (0.01 * 255) * (0.01 * 255);  // (k1*L)^2, k1=0.01
-    const double C2 = (0.03 * 255) * (0.03 * 255);  // (k2*L)^2, k2=0.03
-
+    const double C1 = (0.01*255)*(0.01*255);
+    const double C2 = (0.03*255)*(0.03*255);
     double num = (2*mu1*mu2 + C1) * (2*sig12 + C2);
     double den = (mu1*mu1 + mu2*mu2 + C1) * (sig1sq + sig2sq + C2);
-
     return (float)(num / den);
 }
 
 // =============================================================================
 // CUCKOO SEARCH for optimal lambda (Algorithm 2, Section 4.6)
 //
-// Fitness function: we want the LARGEST lambda that still preserves
-// structural similarity of the smooth region (SSIM of F_OTP vs F_s).
-//
-// Rationale: λ=0 trivially gives SSIM=1 (no change). We want the largest
-// λ that diffuses texture details (anisotropically) without degrading SSIM
-// below a threshold. This matches the paper's intent: CS finds the
-// "stability parameter" (Section 4.6) — the largest stable λ.
-//
-// Fitness = lambda * SSIM_weight
-// where SSIM_weight = 1.0 if SSIM > threshold, else very negative
-// This drives the optimizer to find large λ with good SSIM.
+// Now that ODAD uses F_hat as boundary (not zero), the fitness function
+// correctly measures smooth-region structural preservation.
 // =============================================================================
 static float levyStep(std::mt19937& rng, float beta) {
     std::normal_distribution<float> nd(0, 1);
-    double num = std::tgamma(1.0 + beta) * std::sin(kPi * beta / 2.0);
-    double den = std::tgamma((1.0 + beta) / 2.0) * beta *
-                 std::pow(2.0, (beta - 1.0) / 2.0);
-    float sig = (float)std::pow(std::abs(num / den), 1.0 / beta);
+    double num = std::tgamma(1.0+beta) * std::sin(kPi*beta/2.0);
+    double den = std::tgamma((1.0+beta)/2.0) * beta *
+                 std::pow(2.0, (beta-1.0)/2.0);
+    float sig = (float)std::pow(std::abs(num/den), 1.0/beta);
     float u = nd(rng) * sig;
     float v = nd(rng);
     if (std::abs(v) < 1e-10f) v = 1e-10f;
-    return u / std::pow(std::abs(v), 1.0f / beta);
+    return u / std::pow(std::abs(v), 1.0f/beta);
 }
 
-static float findLambda(const std::vector<float>& Fs,
+static float findLambda(const std::vector<float>& Fhat,
     const std::vector<bool>& edgeMask,
     int w, int h,
     const OdasParams& params)
 {
     const float lMin = 0.0f;
-    const float lMax = kPi / 4.0f;   // π/4 ≈ 0.7854
-
-    // SSIM threshold: we want λ large AND SSIM high
-    // Threshold of 0.998 means we allow tiny degradation for larger λ
+    const float lMax = kPi / 4.0f;
     const float ssimThreshold = 0.998f;
 
     const int   n     = params.csNests;
@@ -478,54 +456,49 @@ static float findLambda(const std::vector<float>& Fs,
     const float pa    = params.csPa;
     const float beta  = params.csLevyBeta;
 
-    // Fitness: maximize lambda weighted by SSIM quality
-    // If SSIM drops below threshold, heavy penalty.
+    // Fitness: maximize lambda while keeping SSIM(ODAD_output, Fhat_smooth) high
+    // λ=0 gives score=0 (no diffusion, no benefit)
+    // Large λ with good SSIM gives high score
     auto fitness = [&](float lambda) -> float {
-        if (lambda < 1e-6f) return 0.0f;  // λ=0 gives no improvement, score=0
+        if (lambda < 1e-6f) return 0.0f;
 
         std::vector<float> FOTP;
-        applyODAD(Fs, edgeMask, w, h, FOTP, lambda, params.K,
-                  params.odadIterations);
+        applyODAD(Fhat, edgeMask, w, h, FOTP, lambda,
+                  params.K, params.odadIterations);
 
-        float ssim = computeSSIM(Fs, FOTP, edgeMask, w, h);
+        // Restore smooth values for SSIM (FOTP has 0 at edges after applyODAD)
+        // Compare FOTP smooth values vs Fhat smooth values
+        float ssim = computeSSIM(Fhat, FOTP, edgeMask, w, h);
 
-        if (ssim < ssimThreshold) {
-            // Penalty: below threshold, heavily penalize
-            return -1.0f + ssim;  // negative score
-        }
-        // Reward larger lambda that still maintains SSIM
-        return lambda * ssim;
+        if (ssim < ssimThreshold)
+            return -1.0f + ssim;  // penalty
+
+        return lambda * ssim;     // maximize large lambda with good SSIM
     };
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> ur(lMin, lMax);
     std::uniform_real_distribution<float> u01(0.0f, 1.0f);
 
-    // Initialize population
     std::vector<float> nests(n), fits(n);
     for (int i = 0; i < n; ++i) {
         nests[i] = ur(rng);
         fits[i]  = fitness(nests[i]);
     }
 
-    // Best solution
     int bi = (int)(std::max_element(fits.begin(), fits.end()) - fits.begin());
     float bL = nests[bi], bF = fits[bi];
 
     std::cout << "  [ODAS-CS] n=" << n << " MAXit=" << MAXit
-              << " λ_range=[0, π/4=" << lMax << "]" << std::endl;
+              << " λ_range=[0, π/4=" << std::fixed << std::setprecision(4)
+              << lMax << "]" << std::endl;
 
     for (int t = 0; t < MAXit; ++t) {
         for (int i = 0; i < n; ++i) {
-            // Lévy flight: new solution
             float step = levyStep(rng, beta);
-            // Step scale: 1% of range, modulated by Lévy step
             float newL = nests[i] + 0.01f * (lMax - lMin) * step;
             newL = std::max(lMin, std::min(lMax, newL));
-
             float newF = fitness(newL);
-
-            // Choose random nest j to compare
             int j = (int)(u01(rng) * n) % n;
             if (newF > fits[j]) {
                 nests[j] = newL;
@@ -534,7 +507,6 @@ static float findLambda(const std::vector<float>& Fs,
             }
         }
 
-        // Abandon worst pa fraction of nests, replace with random
         int na = std::max(1, (int)(pa * n));
         std::vector<int> si(n);
         std::iota(si.begin(), si.end(), 0);
@@ -553,9 +525,8 @@ static float findLambda(const std::vector<float>& Fs,
                       << "  fit=" << bF << std::endl;
     }
 
-    // If no λ > 0 was found with good SSIM, use a safe small value
     if (bL < 1e-6f) {
-        bL = lMax * 0.1f;  // fallback: 10% of max
+        bL = lMax * 0.5f;
         std::cout << "  [ODAS-CS] Fallback λ=" << bL << std::endl;
     }
 
@@ -565,12 +536,10 @@ static float findLambda(const std::vector<float>& Fs,
 }
 
 // =============================================================================
-// IHR COMPOSITION (Eq. 12)
-// F_IHR = F_AES + F_OTP
-//
-// F_AES: non-zero at edge locations (sharpened edge values)
-// F_OTP: non-zero at smooth locations (ODAD-filtered smooth values)
-// Their sum reconstructs the full image with enhancements.
+// IHR COMPOSITION (Eq. 12): F_IHR = F_AES + F_OTP
+// F_AES: sharpened edge values at edge locations, 0 at smooth
+// F_OTP: diffused smooth values at smooth locations, 0 at edges
+// Sum gives full image with both regions enhanced.
 // =============================================================================
 static void composeIHR(const std::vector<float>& FAES,
     const std::vector<float>& FOTP,
@@ -584,10 +553,8 @@ static void composeIHR(const std::vector<float>& FAES,
 }
 
 // =============================================================================
-// RESIDUAL SHARPENING (Eqs. 13, 14)
-// F_BHR = Lanczos3_Downscale(Lanczos3_Upscale(F_IHR, s), s)
-// F_RES = F_IHR - F_BHR
-// F_RHR = F_IHR + F_RES = 2*F_IHR - F_BHR
+// RESIDUAL SHARPENING (Eqs. 13-14)
+// F_RHR = 2*F_IHR - F_BHR
 // =============================================================================
 static void residual(const std::vector<float>& FIHR,
     int w, int h, int sf,
@@ -597,16 +564,15 @@ static void residual(const std::vector<float>& FIHR,
     std::vector<float> up, bhr;
     L3up(FIHR, w, h, up, uw, uh);
     L3dn(up, uw, uh, bhr, w, h);
-
     size_t N = (size_t)w * h;
     FRHR.resize(N);
     for (size_t i = 0; i < N; ++i)
         FRHR[i] = std::max(0.0f, std::min(255.0f,
-            FIHR[i] + (FIHR[i] - bhr[i])));  // = 2*FIHR - BHR
+            FIHR[i] + (FIHR[i] - bhr[i])));
 }
 
 // =============================================================================
-// COLOR CONVERSION HELPERS
+// COLOR HELPERS
 // =============================================================================
 static void rgb2ycbcr(const unsigned char* rgb, int w, int h,
     std::vector<float>& Y, std::vector<float>& Cb, std::vector<float>& Cr)
@@ -620,7 +586,6 @@ static void rgb2ycbcr(const unsigned char* rgb, int w, int h,
         Cr[i] =  0.5f*r - 0.41869f*g - 0.08131f*b + 128.0f;
     }
 }
-
 static void bilinUp(const std::vector<float>& src, int iw, int ih,
     std::vector<float>& dst, int ow, int oh)
 {
@@ -639,11 +604,10 @@ static void bilinUp(const std::vector<float>& src, int iw, int ih,
             float p01 = getPixelF(src, iw, ih, x0,   y0+1);
             float p11 = getPixelF(src, iw, ih, x0+1, y0+1);
             dst[(size_t)oy*ow + ox] =
-                (p00 + u*(p10-p00)) * (1-v) + (p01 + u*(p11-p01)) * v;
+                (p00 + u*(p10-p00))*(1-v) + (p01 + u*(p11-p01))*v;
         }
     }
 }
-
 static void bilinUpRGBA(const unsigned char* src, int iw, int ih,
     unsigned char* dst, int ow, int oh)
 {
@@ -662,12 +626,11 @@ static void bilinUpRGBA(const unsigned char* src, int iw, int ih,
                 float p00 = src[(y0*iw+x0)*4+c], p10 = src[(y0*iw+x1)*4+c];
                 float p01 = src[(y1*iw+x0)*4+c], p11 = src[(y1*iw+x1)*4+c];
                 dst[(oy*ow+ox)*4+c] = clampByte(
-                    (p00 + u*(p10-p00)) * (1-v) + (p01 + u*(p11-p01)) * v);
+                    (p00+u*(p10-p00))*(1-v) + (p01+u*(p11-p01))*v);
             }
         }
     }
 }
-
 static void ycbcr2rgba(const std::vector<float>& Y,
     const std::vector<float>& Cb, const std::vector<float>& Cr,
     const unsigned char* al, unsigned char* dst, int w, int h)
@@ -682,71 +645,68 @@ static void ycbcr2rgba(const std::vector<float>& Y,
 }
 
 // =============================================================================
-// MAIN PIPELINE (per channel)
+// PIPELINE (per channel)
 // =============================================================================
 static std::vector<float> odasPipeline(
     const std::vector<float>& ch,
-    int inW, int inH, int outW, int outH,
-    int sf,
-    const OdasParams& params,
-    bool verbose)
+    int inW, int inH, int outW, int outH, int sf,
+    const OdasParams& params, bool verbose)
 {
-    // ── Step 1: Lanczos3 Upscale ──────────────────────────────────────────
+    // Step 1: Lanczos3 upscale → F_hat
     if (verbose) std::cout << "  [ODAS] Step 1: Lanczos3 upscale..." << std::endl;
     std::vector<float> Fhat;
     L3up(ch, inW, inH, Fhat, outW, outH);
 
-    // ── Step 2: Edge Detection + F_E / F_s split ─────────────────────────
+    // Step 2: Canny edge detection → boolean mask only
     if (verbose) std::cout << "  [ODAS] Step 2: Canny edge detection..." << std::endl;
-    std::vector<bool>  edgeMask;
-    std::vector<float> FE, Fs;
-    cannyAndSplit(Fhat, outW, outH, edgeMask, FE, Fs,
+    std::vector<bool> edgeMask;
+    cannyEdgeMask(Fhat, outW, outH, edgeMask,
                   params.cannyLowThresh, params.cannyHighThresh);
     if (verbose) {
         size_t ec = std::count(edgeMask.begin(), edgeMask.end(), true);
         std::cout << "  [ODAS] Edge pixels: " << ec << "/" << (size_t)outW*outH
                   << " (" << std::fixed << std::setprecision(2)
-                  << 100.0f * ec / (outW*outH) << "%)" << std::endl;
+                  << 100.0f*ec/(outW*outH) << "%)" << std::endl;
     }
 
-    // ── Step 3: AES on F_E ───────────────────────────────────────────────
-    if (verbose) std::cout << "  [ODAS] Step 3: AES (convolve H with F_E)..." << std::endl;
+    // Step 3: AES — convolve H with F_hat at edge locations
+    if (verbose) std::cout << "  [ODAS] Step 3: AES (F_hat neighborhood)..." << std::endl;
     std::vector<float> FAES;
-    applyAES(FE, edgeMask, outW, outH, FAES);
+    applyAES(Fhat, edgeMask, outW, outH, FAES);
     if (verbose) {
         double chg = 0; int cnt = 0;
         for (size_t i = 0; i < (size_t)outW*outH; ++i)
-            if (edgeMask[i]) { chg += std::abs(FAES[i] - FE[i]); ++cnt; }
+            if (edgeMask[i]) { chg += std::abs(FAES[i] - Fhat[i]); ++cnt; }
         std::cout << "  [ODAS] AES mean edge change: "
                   << (cnt > 0 ? chg/cnt : 0.0) << " grey levels" << std::endl;
     }
 
-    // ── Step 4: Cuckoo Search for λ ──────────────────────────────────────
+    // Step 4: Cuckoo Search for optimal lambda
     if (verbose) std::cout << "  [ODAS] Step 4: Cuckoo Search for λ..." << std::endl;
-    float lambda = findLambda(Fs, edgeMask, outW, outH, params);
+    float lambda = findLambda(Fhat, edgeMask, outW, outH, params);
 
-    // ── Step 5: ODAD on F_s ──────────────────────────────────────────────
+    // Step 5: ODAD — F_hat initialized everywhere, smooth pixels updated
     if (verbose)
-        std::cout << "  [ODAS] Step 5: ODAD filter (λ="
+        std::cout << "  [ODAS] Step 5: ODAD (λ="
                   << std::fixed << std::setprecision(4) << lambda
                   << ", K=" << params.K << ")..." << std::endl;
     std::vector<float> FOTP;
-    applyODAD(Fs, edgeMask, outW, outH, FOTP, lambda, params.K,
-              params.odadIterations);
+    applyODAD(Fhat, edgeMask, outW, outH, FOTP, lambda,
+              params.K, params.odadIterations);
     if (verbose) {
         double chg = 0; int cnt = 0;
         for (size_t i = 0; i < (size_t)outW*outH; ++i)
-            if (!edgeMask[i]) { chg += std::abs(FOTP[i] - Fs[i]); ++cnt; }
+            if (!edgeMask[i]) { chg += std::abs(FOTP[i] - Fhat[i]); ++cnt; }
         std::cout << "  [ODAS] ODAD mean smooth change: "
                   << (cnt > 0 ? chg/cnt : 0.0) << " grey levels" << std::endl;
     }
 
-    // ── Step 6: IHR = F_AES + F_OTP ─────────────────────────────────────
+    // Step 6: F_IHR = F_AES + F_OTP
     if (verbose) std::cout << "  [ODAS] Step 6: IHR = F_AES + F_OTP..." << std::endl;
     std::vector<float> FIHR;
     composeIHR(FAES, FOTP, outW, outH, FIHR);
 
-    // ── Step 7: Residual sharpening ──────────────────────────────────────
+    // Step 7: Residual sharpening
     if (verbose) std::cout << "  [ODAS] Step 7: Residual sharpening..." << std::endl;
     std::vector<float> FRHR;
     residual(FIHR, outW, outH, sf, FRHR);
@@ -755,7 +715,7 @@ static std::vector<float> odasPipeline(
         for (size_t i = 0; i < (size_t)outW*outH; ++i)
             chg += std::abs(FRHR[i] - FIHR[i]);
         std::cout << "  [ODAS] Residual mean change: "
-                  << chg / (outW*outH) << " grey levels" << std::endl;
+                  << chg/(outW*outH) << " grey levels" << std::endl;
     }
 
     return FRHR;
@@ -774,30 +734,25 @@ void scaleODAS(const unsigned char* input, int inW, int inH,
     std::cout << "  [ODAS] Scale:  ~" << sf << "x  K=" << params.K
               << "  iters=" << params.odadIterations << std::endl;
 
-    // Bilinear upscale for alpha channel reference
-    std::vector<unsigned char> bilin((size_t)outW * outH * 4);
+    std::vector<unsigned char> bilin((size_t)outW*outH*4);
     bilinUpRGBA(input, inW, inH, bilin.data(), outW, outH);
 
     if (params.useYCbCr) {
-        // Process Y channel through full pipeline; Cb/Cr upscaled bilinearly
         std::vector<float> Y, Cb, Cr;
         rgb2ycbcr(input, inW, inH, Y, Cb, Cr);
-
         auto FRHR = odasPipeline(Y, inW, inH, outW, outH, sf, params, true);
-
         std::vector<float> CbO, CrO;
         bilinUp(Cb, inW, inH, CbO, outW, outH);
         bilinUp(Cr, inW, inH, CrO, outW, outH);
-
         std::cout << "  [ODAS] Step 8: RGBA output..." << std::endl;
         ycbcr2rgba(FRHR, CbO, CrO, bilin.data(), output, outW, outH);
     } else {
         std::cout << "  [ODAS] RGB mode" << std::endl;
         std::vector<std::vector<float>> ch(3);
         for (int c = 0; c < 3; ++c) {
-            std::vector<float> ci((size_t)inW * inH);
+            std::vector<float> ci((size_t)inW*inH);
             for (int i = 0; i < inW*inH; ++i) ci[i] = input[i*4+c];
-            ch[c] = odasPipeline(ci, inW, inH, outW, outH, sf, params, c == 0);
+            ch[c] = odasPipeline(ci, inW, inH, outW, outH, sf, params, c==0);
         }
         for (int i = 0; i < outW*outH; ++i) {
             output[i*4+0] = clampByte(ch[0][i]);
