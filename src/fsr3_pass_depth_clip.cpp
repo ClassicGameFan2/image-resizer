@@ -81,13 +81,10 @@ void fsr3PassDepthClip(
             // occlusion ∈ [0,1], 0=disoccluded, 1=valid history
             float occlusion = (depthDiff > threshold) ? 0.0f : 1.0f;
 
-            // kMinDisocclusionAccumulation = -0.333 in FSR3.1.4+
-            // Allows partial history even at disoccluded pixels → less popping.
-            // Clamp to [0,1] for the mask stored in the buffer.
-            float maskVal = clamp(
-                occlusion + kMinDisocclusionAccumulation + 0.333f,
-                0.0f, 1.0f);
-            buf.disocclusionMask[idx] = maskVal;
+            // 1.0 = occluded (history valid), 0.0 = disoccluded (history invalid)
+            // kMinDisocclusionAccumulation is applied in the accumulate pass,
+            // not here. The depth clip pass stores the raw binary result.
+            buf.disocclusionMask[idx] = occlusion;
         }
     }
 }
