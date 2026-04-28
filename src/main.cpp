@@ -48,17 +48,19 @@ extern void scaleFSR2(
     Fsr2JitterMode jitterMode,
     const std::set<int>& enabledPasses);
 
+// ── FSR 3.1.5 ─────────────────────────────────────────────────────────────────
+#include "fsr3_context.h"
+
+extern void scaleFSR3(
+    const unsigned char* input, int inW, int inH,
+    unsigned char* output, int outW, int outH,
+    float sharpness, bool useRcas, bool rcasDenoise,
+    float lfga, bool useTepd,
+    float depth, bool useJitter, int numFrames,
+    Fsr2JitterMode jitterMode,
+    const std::set<int>& enabledPasses);
+
 // ── FSR2 RCAS applied to uint8 data ───────────────────────────────────────────
-//
-// Used for cross-RCAS cases (FSR2 RCAS on non-FSR2 upscale output, or
-// FSR2 RCAS as the post-step after FSR2 upscale when auto-tuner is active).
-//
-// Converts uint8→float, applies FSR2 RCAS in linear float space, optionally
-// applies LFGA/TEPD in the same float pass (correct order: RCAS then post-fx),
-// then converts back to uint8.
-//
-// lfga and tepd default to 0/false so this can also be used without post-fx
-// (e.g. during auto-tuner PSNR sweep where LFGA/TEPD must stay off).
 static void applyFSR2_RCAS_uint8(
     const unsigned char* input, int w, int h,
     unsigned char* output,
@@ -74,8 +76,39 @@ static void applyFSR2_RCAS_uint8(
 
     fsr2PassRCAS(floatBuf.data(), w, h, outFloat.data(), sharpness, denoise);
 
-    // Apply LFGA/TEPD in float space after RCAS — correct pipeline order.
-    // This branch is skipped during auto-tuner PSNR sweeps (lfga=0, tepd=false).
+    if (lfga > 0.0f || tepd) {
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                size_t idx = ((size_t)y * w + x) * 4;
+                float3 color(outFloat[idx], outFloat[idx+1], outFloat[idx+2]);
+                color = applyPostProcess(color, x, y, lfga, tepd);
+                outFloat[idx+0] = color.x;
+                outFloat[idx+1] = color.y;
+                outFloat[idx+2] = color.z;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < pixels * 4; i++)
+        output[i] = (unsigned char)(clamp(outFloat[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
+// ── FSR3 RCAS applied to uint8 data ───────────────────────────────────────────
+static void applyFSR3_RCAS_uint8(
+    const unsigned char* input, int w, int h,
+    unsigned char* output,
+    float sharpness, bool denoise,
+    float lfga = 0.0f, bool tepd = false)
+{
+    size_t pixels = (size_t)w * h;
+    std::vector<float> floatBuf(pixels * 4);
+    std::vector<float> outFloat(pixels * 4);
+
+    for (size_t i = 0; i < pixels * 4; i++)
+        floatBuf[i] = input[i] / 255.0f;
+
+    fsr3PassRCAS(floatBuf.data(), w, h, outFloat.data(), sharpness, denoise);
+
     if (lfga > 0.0f || tepd) {
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
@@ -110,26 +143,6 @@ double calculatePSNR(const unsigned char* img1, const unsigned char* img2,
 }
 
 // ── Auto-Tuner ────────────────────────────────────────────────────────────────
-//
-// Finds the RCAS sharpness level that maximizes PSNR for the given combination
-// of upscaling algorithm and RCAS type.
-//
-// Pipeline during PSNR sweep (sterile environment):
-//   1. Downscale original using downAlgo at downScale factor
-//   2. Upscale back to original size using upAlgo (NO RCAS, LFGA=0, TEPD=off)
-//   3. Evaluate base PSNR with no sharpening
-//   4. Sweep sharpness 0.0→2.0 in 0.1 steps using rcasType
-//      - sharpness=0.0 is MAXIMUM (exp2(-0.0)=1.0 multiplier)
-//      - sharpness=2.0 is MINIMUM (exp2(-2.0)=0.25 multiplier)
-//   5. Return the sharpness value that produced the highest PSNR
-//
-// rcasType:       "fsr1-rcas" or "fsr2-rcas" (already resolved, never "auto")
-// rcasDenoise:    FSR1 RCAS denoising flag  — honored when rcasType="fsr1-rcas"
-// fsr2RcasDenoise: FSR2 RCAS denoising flag — honored when rcasType="fsr2-rcas"
-// LFGA/TEPD:      always forced to false/off during PSNR sweep for accuracy
-//
-// FSR2-specific params (fsr2Depth, fsr2Jitter, etc.) are used when upAlgo="fsr2"
-// so the user's FSR2 settings are honored during the upscale reference step.
 void optimizeRCAS(
     const unsigned char* originalImg, int width, int height,
     const std::string& upAlgo,
@@ -140,6 +153,10 @@ void optimizeRCAS(
     float fsr2Depth, bool fsr2Jitter, int fsr2Frames,
     Fsr2JitterMode fsr2JitterMode,
     const std::set<int>& fsr2EnabledPasses,
+    bool fsr3RcasDenoise,
+    float fsr3Depth, bool fsr3Jitter, int fsr3Frames,
+    Fsr2JitterMode fsr3JitterMode,
+    const std::set<int>& fsr3EnabledPasses,
     bool& outUseRcas, float& outSharpness)
 {
     std::cout << "  [Auto-Tuner] Running PSNR optimization ("
@@ -170,16 +187,21 @@ void optimizeRCAS(
     } else if (upAlgo == "fsr") {
         scaleFSR_EASU(downData, downW, downH, upData, width, height, 0.0f, false);
     } else if (upAlgo == "fsr2") {
-        // Honor all FSR2 user settings for the upscale reference.
-        // Strip pass 5 (RCAS) so the upscaled base is sharpening-free.
-        // LFGA=0, TEPD=false for sterile PSNR environment.
         std::set<int> passesNoRcas = fsr2EnabledPasses;
         passesNoRcas.erase(FSR2_PASS_RCAS);
         scaleFSR2(downData, downW, downH, upData, width, height,
-                  0.0f, false, false,   // sharpness irrelevant, RCAS off
-                  0.0f, false,          // lfga=0, tepd=false
+                  0.0f, false, false,
+                  0.0f, false,
                   fsr2Depth, fsr2Jitter, fsr2Frames,
                   fsr2JitterMode, passesNoRcas);
+    } else if (upAlgo == "fsr3") {
+        std::set<int> passesNoRcas3 = fsr3EnabledPasses;
+        passesNoRcas3.erase(FSR3_PASS_RCAS);
+        scaleFSR3(downData, downW, downH, upData, width, height,
+                  0.0f, false, false,
+                  0.0f, false,
+                  fsr3Depth, fsr3Jitter, fsr3Frames,
+                  fsr3JitterMode, passesNoRcas3);
     }
 
     // ── Step 3: Base PSNR (no sharpening) ──────────────────────────────────
@@ -191,22 +213,24 @@ void optimizeRCAS(
               << std::fixed << std::setprecision(2) << bestPsnr << " dB" << std::endl;
 
     // ── Step 4: Sweep sharpness 0.0 → 2.0 in 0.1 steps ─────────────────────
-    // LFGA/TEPD are always false here — they would distort PSNR.
-    // rcasDenoise / fsr2RcasDenoise are honored per the user's flag.
     unsigned char* rcasData = new unsigned char[(size_t)width * height * 4];
 
     for (int i = 0; i <= 20; ++i) {
         float testSharpness = (float)i / 10.0f;
 
-        if (rcasType == "fsr2-rcas") {
+        if (rcasType == "fsr3-rcas") {
+            applyFSR3_RCAS_uint8(upData, width, height, rcasData,
+                                  testSharpness, fsr3RcasDenoise,
+                                  0.0f, false);
+        } else if (rcasType == "fsr2-rcas") {
             applyFSR2_RCAS_uint8(upData, width, height, rcasData,
                                   testSharpness, fsr2RcasDenoise,
-                                  0.0f, false);   // lfga=0, tepd=false
+                                  0.0f, false);
         } else {
             // "fsr1-rcas"
             applyFSR_RCAS(upData, width, height, rcasData,
                            testSharpness, rcasDenoise,
-                           0.0f, false);           // lfga=0, tepd=false
+                           0.0f, false);
         }
 
         double psnr = calculatePSNR(originalImg, rcasData, width, height);
@@ -241,13 +265,10 @@ std::set<int> parsePassList(const std::string& s) {
     }
     return result;
 }
-std::set<int> allPasses() { return {0,1,2,3,4,5,6,7,8}; }
+std::set<int> allPasses()  { return {0,1,2,3,4,5,6,7,8}; }
+std::set<int> allPasses3() { return {0,1,2,3,4,5,6,7,8,9,10}; }
 
 // ── Main image processor ──────────────────────────────────────────────────────
-//
-// resolvedPsnrRcasType: "fsr1-rcas" or "fsr2-rcas" — already resolved from
-//   "auto" in main(). Used by auto-tuner to know which RCAS to test, and
-//   then again in the final output step to apply the winning RCAS.
 bool processImage(
     const std::string& inFile, const std::string& outFile,
     float scale, const std::string& algo,
@@ -260,9 +281,14 @@ bool processImage(
     float fsr2Depth, bool fsr2Jitter, int fsr2Frames,
     Fsr2JitterMode fsr2JitterMode,
     const std::set<int>& fsr2EnabledPasses,
-    float fsr2Sharpness, bool fsr2Rcas, bool fsr2RcasDenoise)
+    float fsr2Sharpness, bool fsr2Rcas, bool fsr2RcasDenoise,
+    // ── FSR3 params ──────────────────────────────────────────────────────────
+    float fsr3Depth, bool fsr3Jitter, int fsr3Frames,
+    Fsr2JitterMode fsr3JitterMode,
+    const std::set<int>& fsr3EnabledPasses,
+    float fsr3Sharpness, bool fsr3Rcas, bool fsr3RcasDenoise)
 {
-    // ── Palette setup (unchanged) ─────────────────────────────────────────
+    // ── Palette setup ─────────────────────────────────────────────────────
     std::vector<ColorRGBA> targetPalette;
     bool hasTransparency = false;
     bool shouldMatch = false;
@@ -301,13 +327,6 @@ bool processImage(
     }
 
     // ── Auto-Tuner ────────────────────────────────────────────────────────
-    // When the auto-tuner runs it finds the PSNR-maximizing sharpness for
-    // resolvedPsnrRcasType. The results are stored in atUseRcas/atSharpness
-    // and used in the final output step further below.
-    //
-    // The auto-tuner always operates at the OUTPUT resolution (width x height)
-    // by downscaling then upscaling back. LFGA/TEPD are never applied during
-    // the sweep — they would add noise and distort PSNR comparisons.
     bool  atUseRcas   = false;
     float atSharpness = 0.0f;
 
@@ -318,26 +337,13 @@ bool processImage(
                      rcasDenoise, fsr2RcasDenoise,
                      fsr2Depth, fsr2Jitter, fsr2Frames,
                      fsr2JitterMode, fsr2EnabledPasses,
+                     fsr3RcasDenoise,
+                     fsr3Depth, fsr3Jitter, fsr3Frames,
+                     fsr3JitterMode, fsr3EnabledPasses,
                      atUseRcas, atSharpness);
     }
 
     // ── Scaling and RCAS ──────────────────────────────────────────────────
-    //
-    // TWO PATHS:
-    //
-    // AUTO-TUNER PATH (runPsnrOpt == true):
-    //   Scale without any RCAS or LFGA/TEPD first. Then apply the winning
-    //   RCAS type with lfga/tepd so the final output matches exactly what
-    //   the auto-tuner measured (minus the lfga/tepd post-fx which do not
-    //   affect the PSNR-optimal sharpness decision).
-    //   This path supports cross-RCAS: fsr2 upscale + fsr1-rcas, or
-    //   fsr1/standard upscale + fsr2-rcas.
-    //
-    // NORMAL PATH (runPsnrOpt == false):
-    //   Original behavior unchanged.
-    //   FSR2: scaleFSR2 handles RCAS + LFGA/TEPD internally.
-    //   FSR1/standard: scale then optionally applyFSR_RCAS.
-
     unsigned char* finalData = nullptr;
 
     if (runPsnrOpt) {
@@ -351,14 +357,25 @@ bool processImage(
                 std::cout << "Error: FSR2 cannot downscale." << std::endl;
                 stbi_image_free(imgData); delete[] finalData; return false;
             }
-            // Strip pass 5 so scaleFSR2 does not apply RCAS internally
             std::set<int> passesNoRcas = fsr2EnabledPasses;
             passesNoRcas.erase(FSR2_PASS_RCAS);
             scaleFSR2(imgData, width, height, finalData, newW, newH,
-                      0.0f, false, false,  // no RCAS
-                      0.0f, false,          // lfga=0, tepd=false
+                      0.0f, false, false,
+                      0.0f, false,
                       fsr2Depth, fsr2Jitter, fsr2Frames,
                       fsr2JitterMode, passesNoRcas);
+        } else if (algo == "fsr3") {
+            if (scale < 1.0f) {
+                std::cout << "Error: FSR3 cannot downscale." << std::endl;
+                stbi_image_free(imgData); delete[] finalData; return false;
+            }
+            std::set<int> passesNoRcas3 = fsr3EnabledPasses;
+            passesNoRcas3.erase(FSR3_PASS_RCAS);
+            scaleFSR3(imgData, width, height, finalData, newW, newH,
+                      0.0f, false, false,
+                      0.0f, false,
+                      fsr3Depth, fsr3Jitter, fsr3Frames,
+                      fsr3JitterMode, passesNoRcas3);
         } else if (algo == "off") {
             std::memcpy(finalData, imgData, (size_t)newW * newH * 4);
         } else if (algo == "nearest") {
@@ -381,15 +398,16 @@ bool processImage(
         if (atUseRcas) {
             unsigned char* rcasOut = new unsigned char[(size_t)newW * newH * 4];
 
-            if (resolvedPsnrRcasType == "fsr2-rcas") {
-                // FSR2 RCAS — operates in float space via helper.
-                // LFGA/TEPD applied inside helper after RCAS (correct order).
+            if (resolvedPsnrRcasType == "fsr3-rcas") {
+                applyFSR3_RCAS_uint8(finalData, newW, newH, rcasOut,
+                                      atSharpness, fsr3RcasDenoise,
+                                      lfga, tepd);
+            } else if (resolvedPsnrRcasType == "fsr2-rcas") {
                 applyFSR2_RCAS_uint8(finalData, newW, newH, rcasOut,
                                       atSharpness, fsr2RcasDenoise,
                                       lfga, tepd);
             } else {
-                // FSR1 RCAS — LFGA/TEPD applied inside applyFSR_RCAS.
-                // rcasDenoise honored as the user specified.
+                // fsr1-rcas
                 applyFSR_RCAS(finalData, newW, newH, rcasOut,
                                atSharpness, rcasDenoise,
                                lfga, tepd);
@@ -425,7 +443,7 @@ bool processImage(
         }
 
     } else {
-        // ── Normal path (no auto-tuner): original behavior unchanged ──────
+        // ── Normal path (no auto-tuner) ───────────────────────────────────
 
         if (algo == "fsr2") {
             if (scale < 1.0f) {
@@ -433,16 +451,25 @@ bool processImage(
                 stbi_image_free(imgData); return false;
             }
             finalData = new unsigned char[(size_t)newW * newH * 4];
-            // scaleFSR2 handles RCAS (pass 5) + LFGA/TEPD internally
             scaleFSR2(imgData, width, height, finalData, newW, newH,
                       fsr2Sharpness, fsr2Rcas, fsr2RcasDenoise,
                       lfga, tepd,
                       fsr2Depth, fsr2Jitter, fsr2Frames,
                       fsr2JitterMode, fsr2EnabledPasses);
+        } else if (algo == "fsr3") {
+            if (scale < 1.0f) {
+                std::cout << "Error: FSR3 cannot downscale. Use scale >= 1.0." << std::endl;
+                stbi_image_free(imgData); return false;
+            }
+            finalData = new unsigned char[(size_t)newW * newH * 4];
+            scaleFSR3(imgData, width, height, finalData, newW, newH,
+                      fsr3Sharpness, fsr3Rcas, fsr3RcasDenoise,
+                      lfga, tepd,
+                      fsr3Depth, fsr3Jitter, fsr3Frames,
+                      fsr3JitterMode, fsr3EnabledPasses);
         } else {
             // FSR1/standard path
             unsigned char* step1Data = new unsigned char[(size_t)newW * newH * 4];
-            // If RCAS will run, hold LFGA/TEPD back so they apply in the RCAS step
             float pass1_lfga = useRcas ? 0.0f : lfga;
             bool  pass1_tepd = useRcas ? false : tepd;
 
@@ -518,9 +545,6 @@ int main(int argc, char** argv) {
     bool runPsnrOpt = false;
     float psnrDownScale = 0.5f;
     std::string psnrDownAlgo = "bicubic";
-    // "auto" is resolved after all args are parsed:
-    //   fsr2 algo  → "fsr2-rcas"
-    //   other algo → "fsr1-rcas"
     std::string psnrRcasType = "auto";
 
     // ── FSR2 options ───────────────────────────────────────────────────────
@@ -532,6 +556,16 @@ int main(int argc, char** argv) {
     float fsr2Sharpness = 0.2f;
     bool fsr2Rcas = true;
     bool fsr2RcasDenoise = false;
+
+    // ── FSR3 options ───────────────────────────────────────────────────────
+    float fsr3Depth = 0.5f;
+    bool fsr3Jitter = true;
+    int fsr3Frames = 32;
+    Fsr2JitterMode fsr3JitterMode = Fsr2JitterMode::BICUBIC;
+    std::set<int> fsr3EnabledPasses = allPasses3();
+    float fsr3Sharpness = 0.2f;
+    bool fsr3Rcas = true;
+    bool fsr3RcasDenoise = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -551,23 +585,14 @@ int main(int argc, char** argv) {
         else if (arg == "--palette-dither"      && i+1<argc) paletteDither   = argv[++i];
 
         // ── Auto-Tuner ────────────────────────────────────────────────────
-        // Syntax: --rcas-max-psnr [value]
-        // value can be any of:
-        //   fsr1-rcas                    → just set RCAS type
-        //   fsr2-rcas                    → just set RCAS type
-        //   0.5,bicubic                  → set downscale factor and algo
-        //   0.5,bicubic,fsr1-rcas        → set all three
-        //   0.5,bicubic,fsr2-rcas        → set all three
         else if (arg == "--rcas-max-psnr") {
             runPsnrOpt = true;
             if (i + 1 < argc) {
                 std::string nextArg = argv[i+1];
                 if (nextArg.find("--") != 0) {
-                    if (nextArg == "fsr1-rcas" || nextArg == "fsr2-rcas") {
-                        // Just a RCAS type, no scale/algo override
+                    if (nextArg == "fsr1-rcas" || nextArg == "fsr2-rcas" || nextArg == "fsr3-rcas") {
                         psnrRcasType = nextArg;
                     } else {
-                        // downscale,algo[,rcastype]
                         size_t comma1 = nextArg.find(',');
                         if (comma1 != std::string::npos) {
                             try {
@@ -577,7 +602,7 @@ int main(int argc, char** argv) {
                                 if (comma2 != std::string::npos) {
                                     psnrDownAlgo = rest.substr(0, comma2);
                                     std::string rcasTok = rest.substr(comma2 + 1);
-                                    if (rcasTok == "fsr1-rcas" || rcasTok == "fsr2-rcas")
+                                    if (rcasTok == "fsr1-rcas" || rcasTok == "fsr2-rcas" || rcasTok == "fsr3-rcas")
                                         psnrRcasType = rcasTok;
                                 } else {
                                     psnrDownAlgo = rest;
@@ -585,7 +610,7 @@ int main(int argc, char** argv) {
                             } catch(...) {}
                         }
                     }
-                    i++; // consume the argument
+                    i++;
                 }
             }
         }
@@ -604,6 +629,21 @@ int main(int argc, char** argv) {
         else if (arg == "--fsr2-rcas"         && i+1<argc) fsr2Rcas         = (std::string(argv[++i]) == "on");
         else if (arg == "--fsr2-rcas-denoise" && i+1<argc) fsr2RcasDenoise  = (std::string(argv[++i]) == "on");
         else if (arg == "--onlyenablepasses"  && i+1<argc) fsr2EnabledPasses = parsePassList(argv[++i]);
+
+        // ── FSR3 options ──────────────────────────────────────────────────
+        else if (arg == "--fsr3-depth"        && i+1<argc) fsr3Depth        = std::stof(argv[++i]);
+        else if (arg == "--fsr3-jitter"       && i+1<argc) fsr3Jitter       = (std::string(argv[++i]) == "on");
+        else if (arg == "--fsr3-frames"       && i+1<argc) fsr3Frames       = std::stoi(argv[++i]);
+        else if (arg == "--fsr3-jitter-mode"  && i+1<argc) {
+            std::string m = argv[++i];
+            if      (m == "bilinear")  fsr3JitterMode = Fsr2JitterMode::BILINEAR;
+            else if (m == "bicubic")   fsr3JitterMode = Fsr2JitterMode::BICUBIC;
+            else if (m == "lanczos3")  fsr3JitterMode = Fsr2JitterMode::LANCZOS3;
+        }
+        else if (arg == "--fsr3-sharpness"    && i+1<argc) fsr3Sharpness    = std::stof(argv[++i]);
+        else if (arg == "--fsr3-rcas"         && i+1<argc) fsr3Rcas         = (std::string(argv[++i]) == "on");
+        else if (arg == "--fsr3-rcas-denoise" && i+1<argc) fsr3RcasDenoise  = (std::string(argv[++i]) == "on");
+        else if (arg == "--onlyenablepasses3" && i+1<argc) fsr3EnabledPasses = parsePassList(argv[++i]);
 
         else if (inputPath.empty())  inputPath  = arg;
         else if (outputPath.empty()) outputPath = arg;
@@ -631,18 +671,35 @@ int main(int argc, char** argv) {
         std::cout << "    Passes: 0=DepthClip 1=ReconstructDepth 2=Lock\n";
         std::cout << "            3=Accumulate 4=AccumulateSharpen 5=RCAS\n";
         std::cout << "            6=LuminancePyramid 7=GenerateReactive 8=TCR\n\n";
+        std::cout << "=== FSR 3.1.5 (--algo fsr3) ===\n";
+        std::cout << "  --fsr3-jitter on|off            (default on)\n";
+        std::cout << "  --fsr3-frames 32                (default 32)\n";
+        std::cout << "  --fsr3-jitter-mode bilinear|bicubic|lanczos3  (default bicubic)\n";
+        std::cout << "  --fsr3-depth 0.5                (default 0.5)\n";
+        std::cout << "  --fsr3-sharpness 0.2            (default 0.2, 0.0=max, 2.0=min)\n";
+        std::cout << "  --fsr3-rcas on|off              (default on)\n";
+        std::cout << "  --fsr3-rcas-denoise on|off      (default off)\n";
+        std::cout << "  --onlyenablepasses3 0,1,...,10  (all by default)\n";
+        std::cout << "    Passes: 0=DepthClip 1=ReconstructDepth 2=Lock\n";
+        std::cout << "            3=PrepareReactivity 4=Accumulate\n";
+        std::cout << "            5=AccumulateSharpen 6=RCAS\n";
+        std::cout << "            7=GenerateReactive 8=TCR\n";
+        std::cout << "            9=NewLocks 10=LuminancePyramid\n\n";
         std::cout << "=== Auto-Tuner ===\n";
         std::cout << "  --rcas-max-psnr [arg]\n";
         std::cout << "    arg is optional and can be:\n";
         std::cout << "      fsr1-rcas                   use FSR1 RCAS for sweep\n";
         std::cout << "      fsr2-rcas                   use FSR2 RCAS for sweep\n";
+        std::cout << "      fsr3-rcas                   use FSR3 RCAS for sweep\n";
         std::cout << "      0.5,bicubic                 downscale factor + algo\n";
         std::cout << "      0.5,bicubic,fsr1-rcas       all three options\n";
         std::cout << "      0.5,bicubic,fsr2-rcas       all three options\n";
-        std::cout << "    Default RCAS type: fsr1-rcas for non-FSR2 algos,\n";
-        std::cout << "                       fsr2-rcas for --algo fsr2\n";
+        std::cout << "      0.5,bicubic,fsr3-rcas       all three options\n";
+        std::cout << "    Default RCAS type: fsr1-rcas for non-FSR2/FSR3 algos,\n";
+        std::cout << "                       fsr2-rcas for --algo fsr2,\n";
+        std::cout << "                       fsr3-rcas for --algo fsr3\n";
         std::cout << "    LFGA/TEPD are always disabled during PSNR sweep.\n";
-        std::cout << "    rcas-denoise / fsr2-rcas-denoise flags are honored.\n";
+        std::cout << "    rcas-denoise / fsr2-rcas-denoise / fsr3-rcas-denoise honored.\n";
         return 1;
     }
 
@@ -651,8 +708,7 @@ int main(int argc, char** argv) {
     // FSR1 RCAS on/off
     bool useRcas = (rcasInput == "on" || (rcasInput == "auto" && algo == "fsr"));
 
-    // FSR2 RCAS on/off: controlled exclusively via enabledPasses (pass 5).
-    // sharpness=0.0 means maximum sharpening, not off.
+    // FSR2 RCAS on/off: controlled via enabledPasses (pass 5).
     if (!fsr2Rcas) {
         fsr2EnabledPasses.erase(FSR2_PASS_RCAS);
     }
@@ -660,11 +716,20 @@ int main(int argc, char** argv) {
         fsr2Rcas = false;
     }
 
+    // FSR3 RCAS on/off: controlled via enabledPasses (pass 6).
+    if (!fsr3Rcas) {
+        fsr3EnabledPasses.erase(FSR3_PASS_RCAS);
+    }
+    if (!fsr3EnabledPasses.count(FSR3_PASS_RCAS)) {
+        fsr3Rcas = false;
+    }
+
     // Resolve "auto" psnrRcasType based on the upscaling algorithm.
-    // This must happen after --algo is fully parsed.
     std::string resolvedPsnrRcasType = psnrRcasType;
     if (resolvedPsnrRcasType == "auto") {
-        resolvedPsnrRcasType = (algo == "fsr2") ? "fsr2-rcas" : "fsr1-rcas";
+        if      (algo == "fsr2") resolvedPsnrRcasType = "fsr2-rcas";
+        else if (algo == "fsr3") resolvedPsnrRcasType = "fsr3-rcas";
+        else                     resolvedPsnrRcasType = "fsr1-rcas";
     }
 
     // ── Dispatch ──────────────────────────────────────────────────────────
@@ -678,7 +743,10 @@ int main(int argc, char** argv) {
             resolvedPsnrRcasType,
             fsr2Depth, fsr2Jitter, fsr2Frames,
             fsr2JitterMode, fsr2EnabledPasses,
-            fsr2Sharpness, fsr2Rcas, fsr2RcasDenoise);
+            fsr2Sharpness, fsr2Rcas, fsr2RcasDenoise,
+            fsr3Depth, fsr3Jitter, fsr3Frames,
+            fsr3JitterMode, fsr3EnabledPasses,
+            fsr3Sharpness, fsr3Rcas, fsr3RcasDenoise);
     };
 
     if (fs::is_directory(inputPath)) {
