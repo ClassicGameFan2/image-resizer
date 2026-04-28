@@ -10,17 +10,17 @@ set(STB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 file(DOWNLOAD "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h" "${STB_DIR}/stb_image.h")
 file(DOWNLOAD "https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h" "${STB_DIR}/stb_image_write.h")
 
-# Auto-download LodePNG for 8-bit palette support
+# Auto-download LodePNG
 file(DOWNLOAD "https://raw.githubusercontent.com/lvandeve/lodepng/master/lodepng.h" "${STB_DIR}/lodepng.h")
 file(DOWNLOAD "https://raw.githubusercontent.com/lvandeve/lodepng/master/lodepng.cpp" "${STB_DIR}/lodepng.cpp")
 
 include_directories(${STB_DIR})
 
-add_executable(image-resizer 
-    src/main.cpp 
-    src/stb.cpp 
-    src/fsr_easu.cpp 
-    src/fsr_rcas.cpp 
+add_executable(image-resizer
+    src/main.cpp
+    src/stb.cpp
+    src/fsr_easu.cpp
+    src/fsr_rcas.cpp
     src/scalers.cpp
     src/dither.cpp
     # FSR 2.3.4 CPU Port
@@ -34,6 +34,18 @@ add_executable(image-resizer
     src/fsr2_pass_reactive.cpp
     src/fsr2_context.cpp
     src/fsr2_main.cpp
+    # FSR 3.1.5 CPU Port
+    src/fsr3_pass_luminance.cpp
+    src/fsr3_pass_reconstruct_depth.cpp
+    src/fsr3_pass_depth_clip.cpp
+    src/fsr3_pass_prepare_reactivity.cpp
+    src/fsr3_pass_lock.cpp
+    src/fsr3_pass_new_locks.cpp
+    src/fsr3_pass_accumulate.cpp
+    src/fsr3_pass_rcas.cpp
+    src/fsr3_pass_reactive.cpp
+    src/fsr3_context.cpp
+    src/fsr3_main.cpp
     third_party/lodepng.cpp
 )
 
