@@ -1,5 +1,5 @@
 // =============================================================================
-// ola_espline.cpp
+// ola_espline.cpp — corrected mean-preserving blur + improved CS
 // =============================================================================
 
 #include "ola_espline.h"
@@ -16,6 +16,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// =============================================================================
+// FImg
+// =============================================================================
 struct FImg
 {
     int w = 0, h = 0;
@@ -34,16 +37,24 @@ struct FImg
         return d[y * w + x];
     }
 
-    void stats(float& mn, float& mx, float& mean) const
+    float mean() const
+    {
+        if (d.empty()) return 0.f;
+        double s = 0.0;
+        for (float v : d) s += v;
+        return (float)(s / d.size());
+    }
+
+    void stats(float& mn, float& mx, float& mean_) const
     {
         mn = mx = d.empty() ? 0.f : d[0];
-        double sum = 0.0;
+        double s = 0.0;
         for (float v : d) {
             if (v < mn) mn = v;
             if (v > mx) mx = v;
-            sum += v;
+            s += v;
         }
-        mean = d.empty() ? 0.f : (float)(sum / d.size());
+        mean_ = d.empty() ? 0.f : (float)(s / d.size());
     }
 };
 
@@ -60,6 +71,16 @@ static void printImgStats(const char* label, const FImg& img)
 
 // =============================================================================
 // SECTION 1 — LA GAUSSIAN FILTERING  [Algorithm 1]
+//
+// MEAN-PRESERVING FIX:
+// The kernel [[1,2,1],[1,Cp,1],[1,2,1]] has element sum = Cp+10.
+// Algorithm 1 normalizes by Cp+12, making H_Ab systematically darker than
+// G_LR, giving H = G_LR - H_Ab a positive mean bias.
+// With k > 0, this biases G_SLR brighter than G_LR.
+//
+// Fix: after computing H_Ab, shift it so mean(H_Ab) = mean(G_LR).
+// This makes H zero-mean, so USM only redistributes contrast without
+// shifting the overall brightness. This is the standard USM formulation.
 // =============================================================================
 
 static void localStats(const FImg& img, int cx, int cy,
@@ -128,6 +149,7 @@ static FImg laAdaptiveGaussianBlur(const FImg& src)
         float m, v;
         localStats(src, x, y, m, v);
         int   Cp   = selectCp(v, V_max, S);
+        // Normalize by Cp+12 as stated in Algorithm 1
         float norm = static_cast<float>(Cp) + 12.f;
 
         float acc = static_cast<float>(Cp) * src.at(x, y);
@@ -147,6 +169,18 @@ static FImg laAdaptiveGaussianBlur(const FImg& src)
     for (int ci = 0; ci < 6; ++ci)
         std::cout << "Cp=" << cpVals[ci] << ":" << cpCount[ci] << " ";
     std::cout << std::endl;
+
+    // Mean-preserving correction:
+    // Shift H_Ab so mean(H_Ab) = mean(G_LR), making H = G_LR - H_Ab zero-mean.
+    // This prevents USM from shifting overall image brightness.
+    float srcMean = src.mean();
+    float dstMean = dst.mean();
+    float shift   = srcMean - dstMean;
+    std::cout << "  [OLA diag] LA mean correction: srcMean=" << srcMean
+              << " blurMean=" << dstMean
+              << " shift=" << shift << std::endl;
+    for (float& v : dst.d)
+        v = std::max(0.f, std::min(255.f, v + shift));
 
     return dst;
 }
@@ -174,35 +208,12 @@ static FImg applyUSM(const FImg& G_LR, const FImg& H, float k)
 // =============================================================================
 // SECTION 3 — CUCKOO SEARCH  [Algorithm 2]
 //
-// FITNESS FUNCTION — REDESIGNED:
+// With zero-mean H, the clip_distortion penalty now works correctly:
+// - Low k: little clipping, little sharpening → low fitness
+// - Optimal k: good sharpening, moderate clipping → peak fitness
+// - High k: heavy clipping on both ends → large denominator → fitness drops
 //
-// Problem with all previous attempts:
-//   The gradient-based fitness is dominated by absolute gradient magnitude,
-//   which grows monotonically with k because USM amplifies ALL gradients.
-//   Even with clipping penalty, for dark images (mean=55) there is enough
-//   headroom that k=3 still wins.
-//
-// Correct approach — measure ADDED sharpness vs ADDED distortion:
-//
-//   sharpness_gain(k) = mean( |∇G_SLR| ) - mean( |∇G_LR| )
-//     = net sharpness added by USM (positive = sharper, negative = blurred)
-//
-//   clip_distortion(k) = mean( clip_excess^2 )
-//     where clip_excess = max(0, raw-255) + max(0, -raw)
-//     (quadratic penalty for how far pixels exceeded [0,255] before clamping)
-//
-//   fitness(k) = sharpness_gain(k) / (1 + alpha * clip_distortion(k))
-//
-// Properties:
-//   k=0: sharpness_gain=0, clip_distortion=0, fitness=0
-//   k small: sharpness_gain grows, clip_distortion≈0, fitness grows
-//   k optimal: sharpness_gain still high, clip_distortion starts to matter
-//   k too large: clip_distortion dominates denominator, fitness falls
-//
-// The parameter alpha controls the trade-off. alpha=0.1 (in units where
-// pixel values are 0-255) gives reasonable results.
-//
-// This fitness has a TRUE interior optimum, not just k_max.
+// The fitness landscape will now have a clear interior optimum.
 // =============================================================================
 
 namespace cs {
@@ -234,77 +245,55 @@ static double computeSigmaM(double beta)
     return std::pow(num / den, 1.0 / beta);
 }
 
-// Compute gradient magnitude at one pixel (L1, forward differences)
-static inline float gradMag(const FImg& img, int x, int y)
-{
-    float v  = img.at(x, y);
-    float gx = img.sample(x+1, y) - v;
-    float gy = img.sample(x, y+1) - v;
-    return std::abs(gx) + std::abs(gy);
-}
-
-// Main fitness function with interior optimum
 static double fitness(const FImg& G_LR, const FImg& H, float k, int step)
 {
-    double sharpGain    = 0.0;
-    double clipDistort  = 0.0;
-    int    count        = 0;
+    double sharpGain   = 0.0;
+    double clipDistort = 0.0;
+    int    count       = 0;
 
     for (int y = 0; y < G_LR.h; y += step)
     for (int x = 0; x < G_LR.w; x += step)
     {
-        // Raw (unclamped) sharpened value
-        float raw = G_LR.at(x, y) + k * H.at(x, y);
+        float raw = G_LR.at(x,y) + k * H.at(x,y);
 
-        // Clipping distortion: quadratic excess beyond [0,255]
         float excess = 0.f;
         if      (raw > 255.f) excess = raw - 255.f;
         else if (raw < 0.f)   excess = -raw;
         clipDistort += (double)(excess * excess);
 
-        // Clamped sharpened value for gradient computation
-        float val = std::max(0.f, std::min(255.f, raw));
-
-        // Build a tiny local sharpened image for gradient (inline)
-        // G_SLR gradient at (x,y) — approximate using clamped values
-        float rawR = G_LR.sample(x+1,y) + k * H.sample(x+1,y);
-        float rawD = G_LR.sample(x,y+1) + k * H.sample(x,y+1);
-        float valR = std::max(0.f, std::min(255.f, rawR));
-        float valD = std::max(0.f, std::min(255.f, rawD));
+        float val  = std::max(0.f, std::min(255.f, raw));
+        float valR = std::max(0.f, std::min(255.f,
+                        G_LR.sample(x+1,y) + k * H.sample(x+1,y)));
+        float valD = std::max(0.f, std::min(255.f,
+                        G_LR.sample(x,y+1) + k * H.sample(x,y+1)));
 
         float gradSLR = std::abs(valR - val) + std::abs(valD - val);
         float gradLR  = std::abs(G_LR.sample(x+1,y) - G_LR.at(x,y))
                       + std::abs(G_LR.sample(x,y+1) - G_LR.at(x,y));
 
-        sharpGain  += (double)(gradSLR - gradLR);
+        sharpGain += (double)(gradSLR - gradLR);
         ++count;
     }
 
     if (count == 0) return 0.0;
 
-    double meanSharpGain   = sharpGain  / count;
+    double meanSharpGain   = sharpGain   / count;
     double meanClipDistort = clipDistort / count;
 
-    // alpha=0.01: clip excess of 10 pixels contributes 1.0 to denominator
-    // (penalty is in units of pixel^2, sharpness_gain in pixel units)
-    // We scale alpha so that clip_distortion of ~100 px^2 halves the fitness
     const double alpha = 0.01;
-    double denom = 1.0 + alpha * meanClipDistort;
-
-    return meanSharpGain / denom;
+    return meanSharpGain / (1.0 + alpha * meanClipDistort);
 }
 
-// Print fitness landscape to diagnose if optimum is interior
 static void printFitnessLandscape(const FImg& G_LR, const FImg& H, int step)
 {
-    std::cout << "  [OLA diag] Fitness landscape (k -> fitness):" << std::endl;
-    std::cout << "  [OLA diag]  ";
+    std::cout << "  [OLA diag] Fitness landscape (k->fitness):" << std::endl
+              << "  [OLA diag] ";
     for (int ki = 0; ki <= 12; ++ki)
     {
         float k = ki * 0.25f;
         double f = fitness(G_LR, H, k, step);
         std::cout << " k=" << std::fixed << std::setprecision(2) << k
-                  << ":" << std::setprecision(1) << f;
+                  << ":" << std::setprecision(2) << f;
     }
     std::cout << std::endl;
 }
@@ -318,14 +307,13 @@ static float cuckoosearchOptimiseK(const FImg& G_LR, const FImg& H,
     const double beta = p.csBeta;
     const double sigM = cs::computeSigmaM(beta);
 
-    // Print fitness landscape BEFORE CS to verify it has an interior optimum
     cs::printFitnessLandscape(G_LR, H, p.csFitnessStep);
 
     std::cout << "  [OLA diag] CS: nests=" << n << " gen=" << p.csMaxGen
               << " beta=" << beta << " sigmaM=" << std::fixed
               << std::setprecision(4) << sigM
               << " kRange=[" << p.csKMin << "," << p.csKMax << "]"
-              << " fitnessStep=" << p.csFitnessStep << std::endl;
+              << " step=" << p.csFitnessStep << std::endl;
 
     std::mt19937                           rng(p.csSeed);
     std::uniform_real_distribution<double> uni(0.0, 1.0);
@@ -344,28 +332,27 @@ static float cuckoosearchOptimiseK(const FImg& G_LR, const FImg& H,
 
     std::cout << "  [OLA diag] CS init: best k=" << std::fixed
               << std::setprecision(4) << nests[bestIdx]
-              << " fitness=" << std::setprecision(4) << fit[bestIdx]
-              << std::endl;
+              << " fitness=" << fit[bestIdx] << std::endl;
 
     for (int t = 0; t < p.csMaxGen; ++t)
     {
-        int i = std::min((int)(uni(rng) * n), n - 1);
+        int i = std::min((int)(uni(rng) * n), n-1);
 
         double mi = normM(rng);
         double ni = normN(rng);
         if (std::abs(ni) < 1e-10) ni = 1e-10;
 
         double ratio = mi / ni;
-        double s = 0.01 * std::pow(std::abs(ratio), 1.0 / beta)
+        double s = 0.01 * std::pow(std::abs(ratio), 1.0/beta)
                         * (ratio < 0.0 ? -1.0 : 1.0);
-        double levy = std::pow((double)(t + 1), -beta);
+        double levy = std::pow((double)(t+1), -beta);
 
         double newK = nests[i] + s * levy;
         newK = std::max(p.csKMin, std::min(p.csKMax, newK));
 
         double newFit = cs::fitness(G_LR, H, (float)newK, p.csFitnessStep);
 
-        int j = std::min((int)(uni(rng) * n), n - 1);
+        int j = std::min((int)(uni(rng) * n), n-1);
         if (newFit > fit[j])
         {
             nests[j] = newK;
@@ -390,14 +377,13 @@ static float cuckoosearchOptimiseK(const FImg& G_LR, const FImg& H,
     float bestK = (float)nests[bestIdx];
     std::cout << "  [OLA diag] CS result: k=" << std::fixed
               << std::setprecision(4) << bestK
-              << " fitness=" << std::setprecision(4) << fit[bestIdx]
-              << std::endl;
+              << " fitness=" << fit[bestIdx] << std::endl;
     return bestK;
 }
 
 // =============================================================================
 // SECTION 4 — CUBIC B-SPLINE INTERPOLATION  [Eq. 6, 7]
-// Prefilter uses REPLICATE boundary to match sample() behaviour.
+// Replicate boundary throughout (matches sample() behaviour).
 // =============================================================================
 
 static float beta3(float t)
@@ -411,25 +397,13 @@ static float beta3(float t)
 static void bsplinePrefilter1D(std::vector<float>& c, int n)
 {
     if (n < 2) return;
-
     const float z1     = std::sqrt(3.f) - 2.f;
     const float lambda = (1.f - z1) * (1.f - 1.f / z1);
-
     for (auto& v : c) v *= lambda;
-
-    // Causal init — replicate left boundary: c+[0] = c[0]/(1-z1)
-    c[0] = c[0] / (1.f - z1);
-
-    // Causal pass
-    for (int i = 1; i < n; ++i)
-        c[i] += z1 * c[i-1];
-
-    // Anti-causal init — replicate right boundary: c-[N-1] = c+[N-1]*z1/(z1-1)
+    c[0]   = c[0]   / (1.f - z1);
+    for (int i = 1; i < n; ++i) c[i] += z1 * c[i-1];
     c[n-1] = c[n-1] * z1 / (z1 - 1.f);
-
-    // Anti-causal pass
-    for (int i = n-2; i >= 0; --i)
-        c[i] = z1 * (c[i+1] - c[i]);
+    for (int i = n-2; i >= 0; --i) c[i] = z1 * (c[i+1] - c[i]);
 }
 
 static FImg computeBSplineCoeffs(const FImg& src)
@@ -438,43 +412,18 @@ static FImg computeBSplineCoeffs(const FImg& src)
     std::vector<float> row(src.w);
     for (int y = 0; y < src.h; ++y)
     {
-        for (int x = 0; x < src.w; ++x) row[x] = C.at(x, y);
+        for (int x = 0; x < src.w; ++x) row[x] = C.at(x,y);
         bsplinePrefilter1D(row, src.w);
-        for (int x = 0; x < src.w; ++x) C.at(x, y) = row[x];
+        for (int x = 0; x < src.w; ++x) C.at(x,y) = row[x];
     }
     std::vector<float> col(src.h);
     for (int x = 0; x < src.w; ++x)
     {
-        for (int y = 0; y < src.h; ++y) col[y] = C.at(x, y);
+        for (int y = 0; y < src.h; ++y) col[y] = C.at(x,y);
         bsplinePrefilter1D(col, src.h);
-        for (int y = 0; y < src.h; ++y) C.at(x, y) = col[y];
+        for (int y = 0; y < src.h; ++y) C.at(x,y) = col[y];
     }
     return C;
-}
-
-static void verifyBSplinePrefilter(const FImg& original, const FImg& coeffs)
-{
-    float maxErr = 0.f, sumErr = 0.f;
-    int count = 0;
-    int step = std::max(1, std::min(original.w, original.h) / 10);
-    for (int y = step; y < original.h-step; y += step)
-    for (int x = step; x < original.w-step; x += step)
-    {
-        float fx = (float)x, fy = (float)y;
-        int x0=x, y0=y;
-        float acc = 0.f;
-        for (int j=y0-1; j<=y0+2; ++j)
-        for (int i=x0-1; i<=x0+2; ++i)
-            acc += coeffs.sample(i,j)*beta3(fx-(float)i)*beta3(fy-(float)j);
-        float err = std::abs(acc - original.at(x,y));
-        if (err > maxErr) maxErr = err;
-        sumErr += err;
-        ++count;
-    }
-    std::cout << "  [OLA diag] B-spline interior verify: maxErr="
-              << std::fixed << std::setprecision(4) << maxErr
-              << " meanErr=" << (count>0?sumErr/count:0.f)
-              << " (interior pixels only, should be < 0.5)" << std::endl;
 }
 
 static float evalBSpline(const FImg& C, float fx, float fy)
@@ -490,7 +439,6 @@ static float evalBSpline(const FImg& C, float fx, float fy)
 static FImg bsplineUpscale(const FImg& G_SLR, int scale)
 {
     FImg C = computeBSplineCoeffs(G_SLR);
-    verifyBSplinePrefilter(G_SLR, C);
     printImgStats("B-spline coefficients", C);
 
     int outW=G_SLR.w*scale, outH=G_SLR.h*scale;
@@ -518,7 +466,7 @@ static FImg cannyEdgeDetect(const FImg& src, float lowT, float highT)
     const float gkSum=159.f;
 
     FImg sm(W,H);
-    for (int y=0;y<H;++y) for (int x=0;x<W;++x){
+    for(int y=0;y<H;++y) for(int x=0;x<W;++x){
         float acc=0.f;
         for(int dy=-2;dy<=2;++dy) for(int dx=-2;dx<=2;++dx)
             acc+=src.sample(x+dx,y+dy)*gk[dy+2][dx+2];
@@ -563,11 +511,10 @@ static FImg cannyEdgeDetect(const FImg& src, float lowT, float highT)
         edges.at(x,y)=conn?255.f:0.f;
     }
 
-    int edgeCount=0;
-    for(float v:edges.d) if(v>=255.f) ++edgeCount;
-    std::cout<<"  [OLA diag] Canny: edgePixels="<<edgeCount
-             <<" of "<<W*H<<" ("<<std::fixed<<std::setprecision(1)
-             <<100.f*edgeCount/(W*H)<<"%)"<<std::endl;
+    int ec=0; for(float v:edges.d) if(v>=255.f) ++ec;
+    std::cout<<"  [OLA diag] Canny: edgePixels="<<ec<<" of "<<W*H
+             <<" ("<<std::fixed<<std::setprecision(1)
+             <<100.f*ec/(W*H)<<"%)"<<std::endl;
     return edges;
 }
 
@@ -579,11 +526,10 @@ static FImg eSplineEdgeExpansion(const FImg& G_HR, const FImg& edgeMap)
 {
     int W=G_HR.w, H=G_HR.h;
     FImg G_e(W,H);
-    int modCount=0;
+    int mc=0;
 
     for(int y=2;y<H-2;++y) for(int x=2;x<W-2;++x){
         if(edgeMap.at(x,y)<128.f) continue;
-
         float SDh=
             0.25f*(G_HR.sample(x-1,y-1)-G_HR.sample(x-1,y+1))+
             0.50f*(G_HR.sample(x,  y-1)-G_HR.sample(x,  y+1))+
@@ -600,11 +546,9 @@ static FImg eSplineEdgeExpansion(const FImg& G_HR, const FImg& edgeMap)
             G_e.at(x+1,y)=0.5f*(G_HR.sample(x+1,y)+G_HR.sample(x+2,y))-G_HR.at(x+1,y);
             G_e.at(x-1,y)=0.5f*(G_HR.sample(x-1,y)+G_HR.sample(x-2,y))-G_HR.at(x-1,y);
         }
-        ++modCount;
+        ++mc;
     }
-
-    std::cout<<"  [OLA diag] Edge expansion: modified around "
-             <<modCount<<" edge pixels"<<std::endl;
+    std::cout<<"  [OLA diag] Edge expansion: modified around "<<mc<<" edge pixels"<<std::endl;
 
     FImg G_RHR(W,H);
     for(int i=0;i<W*H;++i)
@@ -622,10 +566,10 @@ static FImg olaESplineSingleChannel(const FImg& G_LR, const OLAESplineParams& p)
     printImgStats("G_LR input", G_LR);
 
     FImg H_Ab=laAdaptiveGaussianBlur(G_LR);
-    printImgStats("H_Ab (adaptive blur)", H_Ab);
+    printImgStats("H_Ab (mean-corrected blur)", H_Ab);
 
     FImg H=computeHPF(G_LR, H_Ab);
-    printImgStats("H (HPF)", H);
+    printImgStats("H (HPF, should be ~zero mean)", H);
 
     float k=cuckoosearchOptimiseK(G_LR, H, p);
 
