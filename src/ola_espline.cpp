@@ -1,8 +1,5 @@
 // =============================================================================
-// ola_espline.cpp
-// Implementation of OLA e-spline upscaling.
-// Based on: "An improved Image Interpolation technique using OLA e-spline"
-//            by Jagyanseni Panda and Sukadev Meher
+// ola_espline.cpp  — corrected
 // =============================================================================
 
 #include "ola_espline.h"
@@ -20,8 +17,7 @@
 #endif
 
 // =============================================================================
-// Internal single-channel float image (row-major, x=column, y=row)
-// Pixel values in [0, 255].
+// FImg — single-channel float image, x=column, y=row, values in [0,255]
 // =============================================================================
 struct FImg
 {
@@ -34,6 +30,7 @@ struct FImg
     float  at(int x, int y) const { return d[y * w + x]; }
     float& at(int x, int y)       { return d[y * w + x]; }
 
+    // Clamp-to-edge (replicate) boundary — MUST match prefilter boundary
     float sample(int x, int y) const
     {
         x = std::max(0, std::min(x, w - 1));
@@ -41,7 +38,6 @@ struct FImg
         return d[y * w + x];
     }
 
-    // Diagnostic: compute min, max, mean of pixel values
     void stats(float& mn, float& mx, float& mean) const
     {
         mn = mx = d.empty() ? 0.f : d[0];
@@ -63,8 +59,7 @@ static void printImgStats(const char* label, const FImg& img)
               << "  min=" << std::fixed << std::setprecision(2) << mn
               << "  max=" << mx
               << "  mean=" << mean
-              << "  size=" << img.w << "x" << img.h
-              << std::endl;
+              << "  size=" << img.w << "x" << img.h << std::endl;
 }
 
 // =============================================================================
@@ -87,8 +82,7 @@ static void localStats(const FImg& img, int cx, int cy,
     if (var < 0.f) var = 0.f;
 }
 
-static void globalVarianceBounds(const FImg& src,
-                                  float& V_max, float& V_min)
+static void globalVarianceBounds(const FImg& src, float& V_max, float& V_min)
 {
     V_max = -1.f;
     V_min = std::numeric_limits<float>::max();
@@ -113,6 +107,10 @@ static int selectCp(float v, float V_max, float S)
     else                           return 32;
 }
 
+// Kernel from Algorithm 1 image:
+//   dy=-1:  1  2  1
+//   dy= 0:  1  Cp 1
+//   dy=+1:  1  2  1
 static const float kW[3][3] = {
     {1.f, 2.f, 1.f},
     {1.f, 0.f, 1.f},
@@ -123,25 +121,21 @@ static FImg laAdaptiveGaussianBlur(const FImg& src)
 {
     float V_max, V_min;
     globalVarianceBounds(src, V_max, V_min);
-
     float S = (V_max - V_min) / 6.f;
 
     std::cout << "  [OLA diag] LA filter: V_max=" << V_max
               << " V_min=" << V_min << " S=" << S << std::endl;
 
-    // Count how many pixels get each Cp value
-    int cpCount[6] = {0,0,0,0,0,0}; // for Cp = 2,3,4,8,16,32
+    int cpCount[6] = {};
     static const int cpVals[6] = {2,3,4,8,16,32};
 
     FImg dst(src.w, src.h);
-
     for (int y = 0; y < src.h; ++y)
     for (int x = 0; x < src.w; ++x)
     {
         float m, v;
         localStats(src, x, y, m, v);
-
-        int Cp   = selectCp(v, V_max, S);
+        int   Cp   = selectCp(v, V_max, S);
         float norm = static_cast<float>(Cp) + 12.f;
 
         float acc = static_cast<float>(Cp) * src.at(x, y);
@@ -149,7 +143,7 @@ static FImg laAdaptiveGaussianBlur(const FImg& src)
         for (int dx = -1; dx <= 1; ++dx)
         {
             if (dx == 0 && dy == 0) continue;
-            acc += kW[dy + 1][dx + 1] * src.sample(x + dx, y + dy);
+            acc += kW[dy+1][dx+1] * src.sample(x+dx, y+dy);
         }
         dst.at(x, y) = acc / norm;
 
@@ -172,7 +166,7 @@ static FImg laAdaptiveGaussianBlur(const FImg& src)
 static FImg computeHPF(const FImg& G_LR, const FImg& H_Ab)
 {
     FImg H(G_LR.w, G_LR.h);
-    for (int i = 0; i < (int)G_LR.d.size(); ++i)
+    for (size_t i = 0; i < G_LR.d.size(); ++i)
         H.d[i] = G_LR.d[i] - H_Ab.d[i];
     return H;
 }
@@ -180,13 +174,31 @@ static FImg computeHPF(const FImg& G_LR, const FImg& H_Ab)
 static FImg applyUSM(const FImg& G_LR, const FImg& H, float k)
 {
     FImg out(G_LR.w, G_LR.h);
-    for (int i = 0; i < (int)G_LR.d.size(); ++i)
+    for (size_t i = 0; i < G_LR.d.size(); ++i)
         out.d[i] = std::max(0.f, std::min(255.f, G_LR.d[i] + k * H.d[i]));
     return out;
 }
 
 // =============================================================================
 // SECTION 3 — CUCKOO SEARCH  [Algorithm 2]
+//
+// FITNESS FUNCTION — CORRECTED:
+//
+// Problem with previous fitness (sum of squared gradients):
+//   It is monotonically increasing with k — higher k always wins, so CS
+//   trivially converges to k_max regardless of image content.
+//
+// Correct fitness: measures sharpness while penalising over-sharpening.
+// We use: fitness = gradient_energy * (1 - clip_fraction)^4
+//
+//   gradient_energy = sum of |gradient| over non-border pixels
+//   clip_fraction   = fraction of pixels clamped to 0 or 255
+//
+// When k is too low:  gradient_energy is low → fitness low
+// When k is optimal:  gradient_energy high, clip_fraction low → fitness peaks
+// When k is too high: clip_fraction grows → (1-clip)^4 penalises heavily
+//
+// This gives a true optimum in the interior of [kMin, kMax].
 // =============================================================================
 
 namespace cs {
@@ -208,7 +220,6 @@ static double logGamma(double x)
     double t = x + 7.5;
     return 0.5*std::log(2.0*M_PI) + (x+0.5)*std::log(t) - t + std::log(a);
 }
-
 static double gammaFn(double x) { return std::exp(logGamma(x)); }
 
 static double computeSigmaM(double beta)
@@ -219,23 +230,39 @@ static double computeSigmaM(double beta)
     return std::pow(num / den, 1.0 / beta);
 }
 
+// Fitness: sharpness energy penalised by clipping fraction.
+// step > 1 subsamples pixels for speed.
 static double fitness(const FImg& G_LR, const FImg& H, float k, int step)
 {
-    double f = 0.0;
+    double gradSum  = 0.0;
+    int    total    = 0;
+    int    clipped  = 0;
+
     for (int y = 0; y < G_LR.h; y += step)
     for (int x = 0; x < G_LR.w; x += step)
     {
-        float val  = std::max(0.f, std::min(255.f,
-                         G_LR.at(x,y) + k * H.at(x,y)));
-        float valR = std::max(0.f, std::min(255.f,
-                         G_LR.sample(x+1,y) + k * H.sample(x+1,y)));
-        float valD = std::max(0.f, std::min(255.f,
-                         G_LR.sample(x,y+1) + k * H.sample(x,y+1)));
+        float raw  = G_LR.at(x, y) + k * H.at(x, y);
+        float val  = std::max(0.f, std::min(255.f, raw));
+
+        // Count clipped pixels (those pushed to boundary by sharpening)
+        if (raw < 0.f || raw > 255.f) ++clipped;
+
+        float rawR = G_LR.sample(x+1,y) + k * H.sample(x+1,y);
+        float rawD = G_LR.sample(x,y+1) + k * H.sample(x,y+1);
+        float valR = std::max(0.f, std::min(255.f, rawR));
+        float valD = std::max(0.f, std::min(255.f, rawD));
+
         double gx = valR - val;
         double gy = valD - val;
-        f += gx*gx + gy*gy;
+        gradSum += std::abs(gx) + std::abs(gy); // L1 gradient (less sensitive to outliers)
+        ++total;
     }
-    return f;
+
+    if (total == 0) return 0.0;
+
+    double clipFrac  = (double)clipped / (double)total;
+    double penalty   = std::pow(1.0 - clipFrac, 4.0); // heavy clip penalty
+    return gradSum * penalty;
 }
 
 } // namespace cs
@@ -248,7 +275,8 @@ static float cuckoosearchOptimiseK(const FImg& G_LR, const FImg& H,
     const double sigM = cs::computeSigmaM(beta);
 
     std::cout << "  [OLA diag] CS: nests=" << n << " gen=" << p.csMaxGen
-              << " beta=" << beta << " sigmaM=" << sigM
+              << " beta=" << beta << " sigmaM=" << std::fixed
+              << std::setprecision(4) << sigM
               << " kRange=[" << p.csKMin << "," << p.csKMax << "]"
               << " fitnessStep=" << p.csFitnessStep << std::endl;
 
@@ -269,11 +297,13 @@ static float cuckoosearchOptimiseK(const FImg& G_LR, const FImg& H,
 
     std::cout << "  [OLA diag] CS init: best k=" << std::fixed
               << std::setprecision(4) << nests[bestIdx]
-              << " fitness=" << fit[bestIdx] << std::endl;
+              << " fitness=" << std::setprecision(4) << fit[bestIdx]
+              << std::endl;
 
     for (int t = 0; t < p.csMaxGen; ++t)
     {
         int i = std::min((int)(uni(rng) * n), n - 1);
+
         double mi = normM(rng);
         double ni = normN(rng);
         if (std::abs(ni) < 1e-10) ni = 1e-10;
@@ -282,6 +312,7 @@ static float cuckoosearchOptimiseK(const FImg& G_LR, const FImg& H,
         double s = 0.01 * std::pow(std::abs(ratio), 1.0 / beta)
                         * (ratio < 0.0 ? -1.0 : 1.0);
         double levy = std::pow((double)(t + 1), -beta);
+
         double newK = nests[i] + s * levy;
         newK = std::max(p.csKMin, std::min(p.csKMax, newK));
 
@@ -300,9 +331,9 @@ static float cuckoosearchOptimiseK(const FImg& G_LR, const FImg& H,
         std::sort(idx.begin(), idx.end(),
                   [&](int a, int b){ return fit[a] < fit[b]; });
         int abandon = std::max(1, (int)(p.csPa * n));
-        for (int w = 0; w < abandon; ++w)
+        for (int w2 = 0; w2 < abandon; ++w2)
         {
-            int wi    = idx[w];
+            int wi    = idx[w2];
             nests[wi] = p.csKMin + uni(rng) * (p.csKMax - p.csKMin);
             fit[wi]   = cs::fitness(G_LR, H, (float)nests[wi], p.csFitnessStep);
         }
@@ -312,30 +343,36 @@ static float cuckoosearchOptimiseK(const FImg& G_LR, const FImg& H,
     float bestK = (float)nests[bestIdx];
     std::cout << "  [OLA diag] CS result: k=" << std::fixed
               << std::setprecision(4) << bestK
-              << " fitness=" << fit[bestIdx] << std::endl;
+              << " fitness=" << std::setprecision(4) << fit[bestIdx]
+              << std::endl;
     return bestK;
 }
 
 // =============================================================================
 // SECTION 4 — CUBIC B-SPLINE INTERPOLATION  [Eq. 6, 7]
 //
-// PREFILTER DERIVATION (correct version):
+// PREFILTER — CORRECTED (replicate/clamp-to-edge boundary):
 //
-// The 1-D B-spline interpolation prefilter converts samples s[k] into
-// coefficients c[k] such that:
-//   s[k] = sum_j c[j] * beta3(k - j)   for all integer k
+// The prefilter and evalBSpline MUST use the same boundary condition.
+// evalBSpline uses sample() which clamps to edge (replicate boundary).
+// Therefore the prefilter must also use replicate boundary.
 //
-// This is achieved via the causal/anti-causal IIR with pole z1 = sqrt(3)-2.
+// For replicate boundary:
+//   Left:  s[-k] = s[0]   for all k > 0
+//   Right: s[N-1+k] = s[N-1]  for all k > 0
 //
-// For a signal of length N with MIRROR boundary (symmetric extension):
-//   The signal is extended as s[-k] = s[k] and s[N-1+k] = s[N-1-k].
+// Causal initialisation (replicate left boundary):
+//   The semi-infinite causal filter sees: ..., s[0], s[0], s[0], s[0], s[1], ...
+//   Steady-state response to constant s[0]:
+//     c+[0] = s[0] * sum_{k=0}^{inf} z1^k = s[0] / (1 - z1)
+//   After lambda gain (c[k] = lambda*s[k]):
+//     c+[0] = c[0] / (1 - z1)
 //
-// Causal initialisation (exact for mirror boundary):
-//   c+[0] = sum_{k=0}^{inf} (s[k] + s[-k]) * z1^k
-//           but s[-k] = s[k] for mirror, so:
-//         = s[0] + 2 * sum_{k=1}^{N-1} s[k] * z1^k   (truncated, |z1|^30 < 1e-6)
-//
-// This is the formula used by scipy.ndimage and OpenCV.
+// Anti-causal initialisation (replicate right boundary):
+//   The semi-infinite anti-causal filter sees: ..., s[N-1], s[N-1], s[N-1]
+//   Steady-state:
+//     c-[N-1] = c+[N-1] * z1 / (z1 - 1)    [standard formula]
+//             = c+[N-1] / (1 - 1/z1)
 // =============================================================================
 
 static float beta3(float t)
@@ -356,44 +393,38 @@ static void bsplinePrefilter1D(std::vector<float>& c, int n)
 
     const float z1     = std::sqrt(3.f) - 2.f;   // ≈ -0.2679
     const float lambda = (1.f - z1) * (1.f - 1.f / z1);
-    // lambda = (1 - z1)(1 - 1/z1) = (1 - z1)(z1 - 1)/z1 = -(1-z1)^2 / z1
-    // With z1 = sqrt(3)-2: lambda ≈ 6.0  [gain correction factor]
+    // lambda ≈ 6.0
 
-    // Apply gain
+    // Apply gain correction
     for (auto& v : c) v *= lambda;
 
-    // -----------------------------------------------------------------------
-    // Causal initialisation — mirror (symmetric) boundary:
+    // -------------------------------------------------------------------
+    // Causal initialisation — REPLICATE (clamp-to-edge) left boundary:
+    //   c+[0] = c[0] / (1 - z1)
     //
-    //   c+[0] = c[0] + 2 * sum_{k=1}^{N-1} c[k] * z1^k
-    //
-    // Since |z1| ≈ 0.268, z1^k decays to < 1e-7 by k=30.
-    // We use min(N-1, 30) terms.
-    // -----------------------------------------------------------------------
-    {
-        int horizon = std::min(n - 1, 30);
-        float zk  = z1;
-        float sum = c[0]; // k=0 term
-        for (int k = 1; k <= horizon; ++k, zk *= z1)
-            sum += 2.f * c[k] * zk;
-        c[0] = sum;
-    }
+    // Derivation: the left boundary extends as c[-k] = c[0] for k>0.
+    // The causal init accumulates: c[0]*z1^0 + c[0]*z1^1 + c[0]*z1^2 + ...
+    //   = c[0] * 1/(1-z1)
+    // (This is a geometric series that converges since |z1| < 1.)
+    // -------------------------------------------------------------------
+    c[0] = c[0] / (1.f - z1);
 
-    // Causal pass: c+[k] = c[k] + z1 * c+[k-1]
+    // Causal pass: c+[i] = c[i] + z1 * c+[i-1]
     for (int i = 1; i < n; ++i)
         c[i] += z1 * c[i - 1];
 
-    // -----------------------------------------------------------------------
-    // Anti-causal initialisation — mirror boundary:
+    // -------------------------------------------------------------------
+    // Anti-causal initialisation — REPLICATE (clamp-to-edge) right boundary:
+    //   c-[N-1] = c+[N-1] * z1 / (z1 - 1)
     //
-    //   c-[N-1] = (z1 / (z1^2 - 1)) * (c+[N-1] + z1 * c+[N-2])
-    //
-    // This is the standard formula from Thevenaz 2000, correct for both
-    // mirror and anti-mirror boundaries.
-    // -----------------------------------------------------------------------
-    c[n-1] = (z1 / (z1*z1 - 1.f)) * (z1 * c[n-2] + c[n-1]);
+    // Derivation: the right boundary extends as c[N-1+k] = c[N-1] for k>0.
+    // Steady-state anti-causal: c+[N-1] * sum_{k=1}^{inf} z1^k
+    //   = c+[N-1] * z1 / (1 - z1)  ... then combined with the direct term:
+    //   c-[N-1] = c+[N-1] * z1 / (z1 - 1)
+    // -------------------------------------------------------------------
+    c[n-1] = c[n-1] * z1 / (z1 - 1.f);
 
-    // Anti-causal pass: c-[k] = z1 * (c-[k+1] - c+[k])
+    // Anti-causal pass: c-[i] = z1 * (c-[i+1] - c+[i])
     for (int i = n - 2; i >= 0; --i)
         c[i] = z1 * (c[i+1] - c[i]);
 }
@@ -420,32 +451,29 @@ static FImg computeBSplineCoeffs(const FImg& src)
     return C;
 }
 
-// Verify prefilter correctness: reconstruct at integer positions and check
-// that we recover the original values (max error should be < 0.1).
+// Verify: reconstruct at sampled integer positions, check error < 0.5
 static void verifyBSplinePrefilter(const FImg& original, const FImg& coeffs)
 {
     float maxErr = 0.f, sumErr = 0.f;
     int count = 0;
-    // Check a sample of pixels
     int step = std::max(1, std::min(original.w, original.h) / 10);
     for (int y = 0; y < original.h; y += step)
     for (int x = 0; x < original.w; x += step)
     {
-        // At integer position, evalBSpline should reconstruct original value
         float fx = (float)x, fy = (float)y;
         int x0 = x, y0 = y;
         float acc = 0.f;
-        for (int j = y0 - 1; j <= y0 + 2; ++j)
-        for (int i = x0 - 1; i <= x0 + 2; ++i)
+        for (int j = y0-1; j <= y0+2; ++j)
+        for (int i = x0-1; i <= x0+2; ++i)
             acc += coeffs.sample(i,j) * beta3(fx-(float)i) * beta3(fy-(float)j);
-        float err = std::abs(acc - original.at(x, y));
+        float err = std::abs(acc - original.at(x,y));
         if (err > maxErr) maxErr = err;
         sumErr += err;
         ++count;
     }
     std::cout << "  [OLA diag] B-spline prefilter verify: maxErr="
               << std::fixed << std::setprecision(4) << maxErr
-              << " meanErr=" << (count > 0 ? sumErr/count : 0.f)
+              << " meanErr=" << (count>0 ? sumErr/count : 0.f)
               << " (should be < 0.5)" << std::endl;
 }
 
@@ -454,9 +482,9 @@ static float evalBSpline(const FImg& C, float fx, float fy)
     int x0 = (int)std::floor(fx);
     int y0 = (int)std::floor(fy);
     float acc = 0.f;
-    for (int j = y0 - 1; j <= y0 + 2; ++j)
-    for (int i = x0 - 1; i <= x0 + 2; ++i)
-        acc += C.sample(i, j) * beta3(fx - (float)i) * beta3(fy - (float)j);
+    for (int j = y0-1; j <= y0+2; ++j)
+    for (int i = x0-1; i <= x0+2; ++i)
+        acc += C.sample(i,j) * beta3(fx-(float)i) * beta3(fy-(float)j);
     return acc;
 }
 
@@ -464,10 +492,7 @@ static FImg bsplineUpscale(const FImg& G_SLR, int scale)
 {
     FImg C = computeBSplineCoeffs(G_SLR);
 
-    // Verify the prefilter is working correctly
     verifyBSplinePrefilter(G_SLR, C);
-
-    // Print coefficient stats to check for blow-up
     printImgStats("B-spline coefficients", C);
 
     int outW = G_SLR.w * scale;
@@ -478,7 +503,7 @@ static FImg bsplineUpscale(const FImg& G_SLR, int scale)
     for (int oy = 0; oy < outH; ++oy)
     for (int ox = 0; ox < outW;  ++ox)
     {
-        // Centre-aligned coordinate mapping
+        // Centre-aligned coordinate mapping (matches all other scalers)
         float fx = (ox + 0.5f) / fscale - 0.5f;
         float fy = (oy + 0.5f) / fscale - 0.5f;
         float v  = evalBSpline(C, fx, fy);
@@ -559,15 +584,16 @@ static FImg cannyEdgeDetect(const FImg& src, float lowT, float highT)
         bool conn = false;
         for (int dy = -1; dy <= 1 && !conn; ++dy)
         for (int dx = -1; dx <= 1 && !conn; ++dx)
-            conn = (edges.at(x+dx, y+dy) == 255.f);
+            conn = (edges.at(x+dx,y+dy) == 255.f);
         edges.at(x,y) = conn ? 255.f : 0.f;
     }
 
-    // Count edge pixels
     int edgeCount = 0;
-    for (float v : edges.d) if (v > 128.f) edgeCount++;
+    for (float v : edges.d) if (v >= 255.f) ++edgeCount;
     std::cout << "  [OLA diag] Canny: edgePixels=" << edgeCount
-              << " of " << W*H << " total" << std::endl;
+              << " of " << W*H << " ("
+              << std::fixed << std::setprecision(1)
+              << 100.f*edgeCount/(W*H) << "%)" << std::endl;
 
     return edges;
 }
@@ -579,31 +605,30 @@ static FImg cannyEdgeDetect(const FImg& src, float lowT, float highT)
 static FImg eSplineEdgeExpansion(const FImg& G_HR, const FImg& edgeMap)
 {
     int W = G_HR.w, H = G_HR.h;
-    FImg G_e(W, H);
+    FImg G_e(W, H); // zero delta image
 
-    int modifiedCount = 0;
-
-    for (int y = 2; y < H - 2; ++y)
-    for (int x = 2; x < W - 2; ++x)
+    int modCount = 0;
+    for (int y = 2; y < H-2; ++y)
+    for (int x = 2; x < W-2; ++x)
     {
-        if (edgeMap.at(x, y) < 128.f) continue;
+        if (edgeMap.at(x,y) < 128.f) continue;
 
         float SDh =
-            0.25f * (G_HR.sample(x-1,y-1) - G_HR.sample(x-1,y+1)) +
-            0.50f * (G_HR.sample(x,  y-1) - G_HR.sample(x,  y+1)) +
-            0.25f * (G_HR.sample(x+1,y-1) - G_HR.sample(x+1,y+1));
+            0.25f*(G_HR.sample(x-1,y-1)-G_HR.sample(x-1,y+1)) +
+            0.50f*(G_HR.sample(x,  y-1)-G_HR.sample(x,  y+1)) +
+            0.25f*(G_HR.sample(x+1,y-1)-G_HR.sample(x+1,y+1));
 
         float SDv =
-            0.25f * (G_HR.sample(x-1,y-1) - G_HR.sample(x+1,y-1)) +
-            0.50f * (G_HR.sample(x-1,y  ) - G_HR.sample(x+1,y  )) +
-            0.25f * (G_HR.sample(x-1,y+1) - G_HR.sample(x+1,y+1));
+            0.25f*(G_HR.sample(x-1,y-1)-G_HR.sample(x+1,y-1)) +
+            0.50f*(G_HR.sample(x-1,y  )-G_HR.sample(x+1,y  )) +
+            0.25f*(G_HR.sample(x-1,y+1)-G_HR.sample(x+1,y+1));
 
         if (std::abs(SDh) >= std::abs(SDv))
         {
             float newYm1 = 0.5f*(G_HR.sample(x,y-1)+G_HR.sample(x,y-2));
             float newYp1 = 0.5f*(G_HR.sample(x,y+1)+G_HR.sample(x,y+2));
-            G_e.at(x, y-1) = newYm1 - G_HR.at(x, y-1);
-            G_e.at(x, y+1) = newYp1 - G_HR.at(x, y+1);
+            G_e.at(x,y-1) = newYm1 - G_HR.at(x,y-1);
+            G_e.at(x,y+1) = newYp1 - G_HR.at(x,y+1);
         }
         else
         {
@@ -612,12 +637,13 @@ static FImg eSplineEdgeExpansion(const FImg& G_HR, const FImg& edgeMap)
             G_e.at(x+1,y) = newXp1 - G_HR.at(x+1,y);
             G_e.at(x-1,y) = newXm1 - G_HR.at(x-1,y);
         }
-        ++modifiedCount;
+        ++modCount;
     }
 
     std::cout << "  [OLA diag] Edge expansion: modified around "
-              << modifiedCount << " edge pixels" << std::endl;
+              << modCount << " edge pixels" << std::endl;
 
+    // Eq.(15): G_RHR = G_HR + G_e
     FImg G_RHR(W, H);
     for (int i = 0; i < W*H; ++i)
         G_RHR.d[i] = std::max(0.f, std::min(255.f, G_HR.d[i] + G_e.d[i]));
@@ -628,35 +654,27 @@ static FImg eSplineEdgeExpansion(const FImg& G_HR, const FImg& edgeMap)
 // SECTION 7 — SINGLE-CHANNEL PIPELINE
 // =============================================================================
 
-static FImg olaESplineSingleChannel(const FImg& G_LR,
-                                     const OLAESplineParams& p)
+static FImg olaESplineSingleChannel(const FImg& G_LR, const OLAESplineParams& p)
 {
     std::cout << "  [OLA diag] --- Channel pipeline start ---" << std::endl;
     printImgStats("G_LR input", G_LR);
 
-    // Stage 1
     FImg H_Ab = laAdaptiveGaussianBlur(G_LR);
     printImgStats("H_Ab (adaptive blur)", H_Ab);
 
-    // Stage 2
     FImg H = computeHPF(G_LR, H_Ab);
     printImgStats("H (HPF)", H);
 
-    // Stage 3
     float k = cuckoosearchOptimiseK(G_LR, H, p);
 
-    // Stage 4
     FImg G_SLR = applyUSM(G_LR, H, k);
     printImgStats("G_SLR (sharpened LR)", G_SLR);
 
-    // Stage 5
     FImg G_HR = bsplineUpscale(G_SLR, p.scaleFactor);
     printImgStats("G_HR (B-spline upscaled)", G_HR);
 
-    // Stage 6
     FImg edgeMap = cannyEdgeDetect(G_HR, p.cannyLow, p.cannyHigh);
 
-    // Stage 7
     FImg G_RHR = eSplineEdgeExpansion(G_HR, edgeMap);
     printImgStats("G_RHR (final output)", G_RHR);
 
@@ -689,7 +707,7 @@ void scaleOLAESpline(const unsigned char* input,  int inW,  int inH,
         FImg G_RHR = olaESplineSingleChannel(G_LR, params);
 
         for (int y = 0; y < oH; ++y)
-        for (int x = 0; x < oW; ++x)
+        for (int x = 0; x < oW;  ++x)
         {
             float v = G_RHR.at(x,y);
             output[(y*oW+x)*4+ch] =
@@ -699,10 +717,10 @@ void scaleOLAESpline(const unsigned char* input,  int inW,  int inH,
 
     // Alpha: nearest-neighbour
     for (int oy = 0; oy < oH; ++oy)
-    for (int ox = 0; ox < oW; ++ox)
+    for (int ox = 0; ox < oW;  ++ox)
     {
-        int sx = std::min(ox / params.scaleFactor, inW-1);
-        int sy = std::min(oy / params.scaleFactor, inH-1);
+        int sx = std::min(ox/params.scaleFactor, inW-1);
+        int sy = std::min(oy/params.scaleFactor, inH-1);
         output[(oy*oW+ox)*4+3] = input[(sy*inW+sx)*4+3];
     }
 }
